@@ -4,6 +4,7 @@
 // live spectrum (ImPlot), scrolling waterfall, and burst statistics.
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -36,11 +37,23 @@
 #include "core/engine.h"
 #include "sdr/live_iq_source.h"
 #include "ui/waterfall.h"
+#include "update/version_check.h"
 #include "voice/audio.h"
 
 #ifndef IRIDISCOPE_ASSETS
 #define IRIDISCOPE_ASSETS "assets"
 #endif
+
+#ifndef IRIDISCOPE_VERSION_MAJOR
+#define IRIDISCOPE_VERSION_MAJOR 0
+#endif
+#ifndef IRIDISCOPE_VERSION_MINOR
+#define IRIDISCOPE_VERSION_MINOR 1
+#endif
+#define IRIDI_STR2(x) #x
+#define IRIDI_STR(x) IRIDI_STR2(x)
+#define IRIDISCOPE_VERSION_STRING \
+    IRIDI_STR(IRIDISCOPE_VERSION_MAJOR) "." IRIDI_STR(IRIDISCOPE_VERSION_MINOR)
 
 namespace {
 
@@ -55,6 +68,10 @@ iridi::LiveIqSource g_airspy(iridi::SdrKind::Airspy);
 iridi::Engine g_engine;
 Waterfall g_waterfall;
 iridi::AudioPlayer g_audio;
+
+// Update check.
+iridi::VersionCheck g_version_check;
+const char *kUpdateUrl = "https://sarahsforge.dev/api/version.php?slug=iridiscope";
 
 // Active input: 0 = IQ file, 1 = SDRplay, 2 = HackRF, 3 = Airspy.
 int g_source_kind = 0;
@@ -131,6 +148,7 @@ bool g_show_messages = true;
 bool g_show_sats = true;
 bool g_show_voice = true;
 bool g_show_acars = true;
+bool g_show_about = false;
 int g_selected_voice = -1;
 int g_voice_cache_id = -1;
 std::vector<int16_t> g_voice_cache;
@@ -161,6 +179,14 @@ void add_log(const char *fmt, ...) {
     fprintf(stdout, "%s\n", buf);
     fflush(stdout);
     if (g_log.size() > 2000) g_log.erase(g_log.begin(), g_log.begin() + 500);
+}
+
+void open_url(const char *url) {
+#ifdef _WIN32
+    ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL);
+#else
+    (void)url;
+#endif
 }
 
 GLuint load_texture(const std::string &path, int &out_w, int &out_h) {
@@ -337,6 +363,29 @@ void draw_menu_bar() {
             ImGui::MenuItem("Voice", nullptr, &g_show_voice);
             ImGui::MenuItem("ACARS", nullptr, &g_show_acars);
             ImGui::MenuItem("Source", nullptr, &g_show_source);
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Help")) {
+            switch (g_version_check.state()) {
+            case iridi::VersionCheck::UpdateAvailable: {
+                std::string v = g_version_check.latest_version();
+                std::string label = "Update available: v" + v + "  (click to download)";
+                if (ImGui::MenuItem(label.c_str()))
+                    open_url(g_version_check.product_url().c_str());
+                break;
+            }
+            case iridi::VersionCheck::Checking:
+                ImGui::MenuItem("Checking for updates...", nullptr, false, false);
+                break;
+            case iridi::VersionCheck::Error:
+                ImGui::MenuItem("Update check failed", nullptr, false, false);
+                break;
+            default:
+                ImGui::MenuItem("Up to date", nullptr, false, false);
+                break;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("About IridiScope")) g_show_about = true;
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
@@ -1053,6 +1102,65 @@ void draw_source_window() {
     ImGui::End();
 }
 
+void draw_about_window() {
+    if (!g_show_about) return;
+    ImGui::SetNextWindowSize(ImVec2(480, 400), ImGuiCond_Appearing);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
+                            ImVec2(0.5f, 0.5f));
+    if (ImGui::Begin("About IridiScope###AboutIridiScope", &g_show_about,
+                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking |
+                     ImGuiWindowFlags_NoCollapse)) {
+        ImGui::TextWrapped("IridiScope v" IRIDISCOPE_VERSION_STRING);
+        ImGui::Separator();
+        switch (g_version_check.state()) {
+        case iridi::VersionCheck::Checking:
+            ImGui::TextDisabled("Checking for updates...");
+            break;
+        case iridi::VersionCheck::UpdateAvailable: {
+            std::string v = g_version_check.latest_version();
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Update available: v%s", v.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Open download page"))
+                open_url(g_version_check.product_url().c_str());
+            break;
+        }
+        case iridi::VersionCheck::UpToDate:
+            ImGui::TextDisabled("Up to date.");
+            break;
+        case iridi::VersionCheck::Unreleased:
+            ImGui::TextDisabled("Development build (newer than the published release).");
+            break;
+        case iridi::VersionCheck::Error:
+            ImGui::TextDisabled("Update check failed.");
+            break;
+        default:
+            break;
+        }
+        ImGui::Separator();
+        ImGui::TextWrapped("An Iridium L-band signal analysis workstation by Sarah Rose.");
+        ImGui::Spacing();
+        ImGui::TextWrapped("Built with components from:");
+        ImGui::BulletText("iridium-sniffer (muccc)");
+        ImGui::BulletText("iridium-toolkit (Sec, schneider)");
+        ImGui::BulletText("osmo-ir77 AMBE vocoder (Sylvain Munaut / Osmocom)");
+        ImGui::BulletText("Dear ImGui (Omar Cornut) and ImPlot (Evan Pezent)");
+        ImGui::BulletText("GLFW (Camilla Lowy, Marcus Geelnard)");
+        ImGui::BulletText("FFTW (Matteo Frigo, Steven G. Johnson)");
+        ImGui::BulletText("miniaudio (David Reid) and stb (Sean Barrett)");
+        ImGui::Spacing();
+        ImGui::TextWrapped("SDR backends:");
+        ImGui::BulletText("SDRplay API (SDRplay Ltd)");
+        ImGui::BulletText("libhackrf (Great Scott Gadgets)");
+        ImGui::BulletText("libairspy (Airspy)");
+        ImGui::Spacing();
+        ImGui::TextWrapped("SDR integration was modelled on AirScope by Sarah Rose.");
+        ImGui::TextWrapped("Equirectangular map imagery courtesy of NASA.");
+        ImGui::Spacing();
+        ImGui::TextDisabled("Licensed under the GNU General Public License v3.");
+    }
+    ImGui::End();
+}
+
 void build_default_dock_layout(ImGuiID dockspace_id) {
     ImGui::DockBuilderRemoveNode(dockspace_id);
     ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
@@ -1206,6 +1314,25 @@ static int ap_list_devices() {
     return 0;
 }
 
+static int check_update() {
+    iridi::VersionCheck vc;
+    vc.start(kUpdateUrl, IRIDISCOPE_VERSION_STRING);
+    for (int i = 0; i < 150; ++i) { // up to 15 s
+        auto st = vc.state();
+        if (st != iridi::VersionCheck::Checking && st != iridi::VersionCheck::Idle) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    static const char *names[] = {"Idle", "Checking",     "UpToDate",
+                                  "UpdateAvailable", "Unreleased", "Error"};
+    auto st = vc.state();
+    printf("state=%s\n", names[(int)st]);
+    printf("local=%s\n", IRIDISCOPE_VERSION_STRING);
+    printf("latest=%s\n", vc.latest_version().c_str());
+    printf("product_url=%s\n", vc.product_url().c_str());
+    if (st == iridi::VersionCheck::Error) printf("error=%s\n", vc.error().c_str());
+    return 0;
+}
+
 static int scan_live(iridi::SdrKind kind, double seconds, double rate_hz) {
     iridi::LiveIqSource sdr(kind);
     const char *label = (kind == iridi::SdrKind::HackRF) ? "HackRF" : "SDRplay";
@@ -1286,9 +1413,10 @@ int main(int argc, char **argv) {
         std::string a1 = argv[1];
         if (a1 == "--info" || a1 == "--parse" || a1 == "--frame" || a1 == "--scan" ||
             a1 == "--sdr-list" || a1 == "--sdr-scan" || a1 == "--hrf-list" || a1 == "--hrf-scan" ||
-            a1 == "--ap-list" || a1 == "--ap-scan")
+            a1 == "--ap-list" || a1 == "--ap-scan" || a1 == "--check-update")
             attach_console();
     }
+    if (argc >= 2 && std::string(argv[1]) == "--check-update") return check_update();
     if (argc >= 2 && std::string(argv[1]) == "--sdr-list") return sdr_list_devices();
     if (argc >= 2 && std::string(argv[1]) == "--hrf-list") return hrf_list_devices();
     if (argc >= 2 && std::string(argv[1]) == "--ap-list") return ap_list_devices();
@@ -1344,12 +1472,25 @@ int main(int argc, char **argv) {
     std::string map_path = std::string(IRIDISCOPE_ASSETS) + "/worldmap.jpg";
     g_map_tex = load_texture(map_path, g_map_w, g_map_h);
 
+    g_version_check.start(kUpdateUrl, IRIDISCOPE_VERSION_STRING);
+
     if (argc > 1) open_iq_file(argv[1]);
 
     while (!glfwWindowShouldClose(g_window)) {
         glfwPollEvents();
         if (g_request_open) { g_request_open = false; open_iq_file(open_file_dialog()); }
         if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O)) g_request_open = true;
+
+        // Notify of an available update by appending to the window title once.
+        if (g_version_check.state() == iridi::VersionCheck::UpdateAvailable) {
+            static bool titled = false;
+            if (!titled) {
+                std::string t = "IridiScope - Update available: v" +
+                                g_version_check.latest_version();
+                glfwSetWindowTitle(g_window, t.c_str());
+                titled = true;
+            }
+        }
 
         // Pull new spectrum into the waterfall and auto-range.
         uint64_t seq = g_engine.spectrum_seq();
@@ -1390,6 +1531,7 @@ int main(int argc, char **argv) {
         draw_voice_window();
         draw_acars_window();
         draw_source_window();
+        draw_about_window();
 
         ImGui::Render();
         int fbw, fbh;

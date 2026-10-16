@@ -167,6 +167,7 @@ set(APP_SOURCES
   src/core/file_source.cpp
   src/core/engine.cpp
   src/sdr/live_iq_source.cpp
+  src/update/version_check.cpp
   src/parser/fec.cpp
   src/parser/iridium_parser.cpp
   src/messages/acars.cpp
@@ -232,7 +233,7 @@ endif()
 
 if(MINGW)
   target_link_libraries(IridiScope PRIVATE
-    gdi32 user32 shell32 comdlg32 winmm ws2_32)
+    gdi32 user32 shell32 comdlg32 winmm ws2_32 winhttp)
 
   # Ship the MinGW runtime DLLs next to the executable so it runs without
   # requiring the toolchain bin directory on PATH.

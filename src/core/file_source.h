@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <string>
 
+#include "core/iq_source.h"
+
 namespace iridi {
 
 enum class IqFormat { CI8, CI16, CF32, UNKNOWN };
@@ -31,27 +33,33 @@ struct IqFileInfo {
     uint64_t file_size = 0;
 };
 
-class IqFileSource {
+class IqFileSource : public IqSource {
 public:
     IqFileSource() = default;
-    ~IqFileSource();
+    ~IqFileSource() override;
 
     IqFileSource(const IqFileSource &) = delete;
     IqFileSource &operator=(const IqFileSource &) = delete;
 
     // Opens a file and reads its header. Returns false and sets err on failure.
     bool open(const std::string &path, std::string &err);
-    void close();
+    void close() override;
 
-    bool is_open() const { return fp_ != nullptr; }
+    bool is_open() const override { return fp_ != nullptr; }
     const IqFileInfo &info() const { return info_; }
+
+    int sample_rate() const override { return info_.sample_rate; }
+    double center_frequency() const override { return info_.center_frequency; }
+    uint64_t total_samples() const override { return info_.num_samples; }
+    bool done() const override { return !fp_ || info_.num_samples == 0 || pos_sample_ >= info_.num_samples; }
 
     // Reads up to max_samples complex samples as interleaved float I,Q.
     // Returns the number of complex samples actually read.
-    size_t read_cf32(float *out, size_t max_samples);
+    size_t read_cf32(float *out, size_t max_samples) override;
 
     // Seeks to a complex-sample index. Returns false on failure.
-    bool seek_sample(uint64_t sample_index);
+    bool seekable() const override { return true; }
+    bool seek_sample(uint64_t sample_index) override;
 
     // Current complex-sample position.
     uint64_t tell_sample() const { return pos_sample_; }

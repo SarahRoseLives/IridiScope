@@ -11,20 +11,19 @@ extern "C" void ir_engine_frame_cb(const ir_frame_info_t *info, void *user) {
 
 Engine::~Engine() { stop(); }
 
-bool Engine::start(IqFileSource *source, float threshold) {
+bool Engine::start(IqSource *source, float threshold) {
     if (running_.load()) return false;
     if (!source || !source->is_open()) return false;
 
     source_ = source;
-    const auto &in = source->info();
 
-    double center = in.center_frequency > 0 ? in.center_frequency : 1622000000.0;
-    int rate = in.sample_rate > 0 ? in.sample_rate : 10000000;
+    double center = source->center_frequency() > 0 ? source->center_frequency() : 1622000000.0;
+    int rate = source->sample_rate() > 0 ? source->sample_rate() : 10000000;
 
     pipe_ = ir_pipeline_create(center, rate, threshold, 0, ir_engine_frame_cb, this);
     if (!pipe_) return false;
 
-    total_samples_.store(in.num_samples);
+    total_samples_.store(source->total_samples());
     samples_.store(0);
     done_.store(false);
     paused_.store(false);
@@ -52,6 +51,7 @@ void Engine::stop() {
     if (!running_.load() && !thread_.joinable()) return;
     running_.store(false);
     paused_.store(false);
+    if (source_) source_->wake();
     if (thread_.joinable()) thread_.join();
     if (pipe_) {
         ir_pipeline_destroy(static_cast<ir_pipeline_t *>(pipe_));
@@ -123,16 +123,16 @@ void Engine::thread_main() {
     while (running_.load()) {
         if (paused_.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            int prate = source_->sample_rate() > 0 ? source_->sample_rate() : 1;
             t0 = clock::now() - std::chrono::duration_cast<clock::duration>(
-                     std::chrono::duration<double>(samples_.load() /
-                         (double)(source_->info().sample_rate ? source_->info().sample_rate : 1)));
+                     std::chrono::duration<double>(samples_.load() / (double)prate));
             continue;
         }
 
         size_t n = source_->read_cf32(buf.data(), block);
         if (n == 0) {
-            done_.store(true);
-            break;
+            if (source_->done()) { done_.store(true); break; }
+            continue;
         }
 
         ir_pipeline_feed(static_cast<ir_pipeline_t *>(pipe_), buf.data(), n);
@@ -158,7 +158,7 @@ void Engine::thread_main() {
         }
 
         if (realtime_.load()) {
-            int rate = source_->info().sample_rate;
+            int rate = source_->sample_rate();
             if (rate > 0) {
                 double target = (double)samples_.load() / rate;
                 double elapsed = std::chrono::duration<double>(clock::now() - t0).count();
@@ -184,7 +184,7 @@ EngineStats Engine::stats() const {
     s.running = running_.load();
     s.paused = paused_.load();
     s.done = done_.load();
-    int rate = (source_ && source_->is_open()) ? source_->info().sample_rate : 0;
+    int rate = (source_ && source_->is_open()) ? source_->sample_rate() : 0;
     if (rate > 0) {
         s.elapsed_s = (double)s.samples / rate;
         s.rate_sps = 0; // set by UI from wall clock if needed

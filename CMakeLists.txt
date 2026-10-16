@@ -59,6 +59,55 @@ else()
   endif()
 endif()
 
+# ---- SDRplay (optional native source) -------------------------------------
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+  set(SDRPLAY_ARCH x64)
+else()
+  set(SDRPLAY_ARCH x86)
+endif()
+find_path(SDRPLAY_INCLUDE_DIR NAMES sdrplay_api.h)
+find_library(SDRPLAY_LIBRARY NAMES sdrplay_api)
+# The Windows SDRplay API installs under Program Files, which is not on CMake's
+# default search path. Add hints there (and honour SDRPLAY_API_ROOT /
+# SDRPLAY_API_PATH). On Linux the system paths above already resolve.
+if(WIN32 AND (NOT SDRPLAY_INCLUDE_DIR OR NOT SDRPLAY_LIBRARY))
+  find_path(SDRPLAY_INCLUDE_DIR NAMES sdrplay_api.h
+    HINTS ${SDRPLAY_API_ROOT} "$ENV{SDRPLAY_API_PATH}" "$ENV{ProgramFiles}/SDRplay/API"
+    PATH_SUFFIXES inc)
+  find_library(SDRPLAY_LIBRARY NAMES sdrplay_api
+    HINTS ${SDRPLAY_API_ROOT} "$ENV{SDRPLAY_API_PATH}" "$ENV{ProgramFiles}/SDRplay/API"
+    PATH_SUFFIXES ${SDRPLAY_ARCH})
+endif()
+set(SDRPLAY_FOUND FALSE)
+if(SDRPLAY_INCLUDE_DIR AND SDRPLAY_LIBRARY)
+  set(SDRPLAY_FOUND TRUE)
+  message(STATUS "SDRplay API found: ${SDRPLAY_LIBRARY}")
+else()
+  message(STATUS "SDRplay API not found - SDRplay source disabled")
+endif()
+
+# ---- HackRF (optional native source) --------------------------------------
+find_path(HACKRF_INCLUDE_DIR NAMES libhackrf/hackrf.h)
+find_library(HACKRF_LIBRARY NAMES hackrf libhackrf)
+set(HACKRF_FOUND FALSE)
+if(HACKRF_INCLUDE_DIR AND HACKRF_LIBRARY)
+  set(HACKRF_FOUND TRUE)
+  message(STATUS "HackRF library found: ${HACKRF_LIBRARY}")
+else()
+  message(STATUS "HackRF library not found - HackRF source disabled")
+endif()
+
+# ---- Airspy (optional native source) --------------------------------------
+find_path(AIRSPY_INCLUDE_DIR NAMES airspy.h)
+find_library(AIRSPY_LIBRARY NAMES airspy libairspy)
+set(AIRSPY_FOUND FALSE)
+if(AIRSPY_INCLUDE_DIR AND AIRSPY_LIBRARY)
+  set(AIRSPY_FOUND TRUE)
+  message(STATUS "Airspy library found: ${AIRSPY_LIBRARY}")
+else()
+  message(STATUS "Airspy library not found - Airspy source disabled")
+endif()
+
 # ---- Vendored iridium-sniffer DSP core ------------------------------------
 set(CORE_DIR ${CMAKE_SOURCE_DIR}/references/iridium-sniffer)
 set(CORE_SOURCES
@@ -117,6 +166,7 @@ set(APP_SOURCES
   src/app.cpp
   src/core/file_source.cpp
   src/core/engine.cpp
+  src/sdr/live_iq_source.cpp
   src/parser/fec.cpp
   src/parser/iridium_parser.cpp
   src/messages/acars.cpp
@@ -156,6 +206,30 @@ if(FFTW_LIBRARY AND FFTW_INCLUDE_DIR)
   target_link_libraries(IridiScope PRIVATE ${FFTW_LIBRARY})
 endif()
 
+# SDRplay: compile the backend and link only when the API is present.
+if(SDRPLAY_FOUND)
+  target_sources(IridiScope PRIVATE src/sdr/sdrplay_source.cpp)
+  target_compile_definitions(IridiScope PRIVATE HAS_SDRPLAY=1)
+  target_include_directories(IridiScope PRIVATE ${SDRPLAY_INCLUDE_DIR})
+  target_link_libraries(IridiScope PRIVATE ${SDRPLAY_LIBRARY})
+endif()
+
+# HackRF: compile the backend and link only when libhackrf is present.
+if(HACKRF_FOUND)
+  target_sources(IridiScope PRIVATE src/sdr/hackrf_source.cpp)
+  target_compile_definitions(IridiScope PRIVATE HAS_HACKRF=1)
+  target_include_directories(IridiScope PRIVATE ${HACKRF_INCLUDE_DIR})
+  target_link_libraries(IridiScope PRIVATE ${HACKRF_LIBRARY})
+endif()
+
+# Airspy: compile the backend and link only when libairspy is present.
+if(AIRSPY_FOUND)
+  target_sources(IridiScope PRIVATE src/sdr/airspy_source.cpp)
+  target_compile_definitions(IridiScope PRIVATE HAS_AIRSPY=1)
+  target_include_directories(IridiScope PRIVATE ${AIRSPY_INCLUDE_DIR})
+  target_link_libraries(IridiScope PRIVATE ${AIRSPY_LIBRARY})
+endif()
+
 if(MINGW)
   target_link_libraries(IridiScope PRIVATE
     gdi32 user32 shell32 comdlg32 winmm ws2_32)
@@ -169,6 +243,12 @@ if(MINGW)
     libstdc++-6.dll
     libwinpthread-1.dll
     libssp-0.dll)
+  if(HACKRF_FOUND)
+    list(APPEND MINGW_RUNTIME_DLLS libhackrf.dll libusb-1.0.dll)
+  endif()
+  if(AIRSPY_FOUND)
+    list(APPEND MINGW_RUNTIME_DLLS libairspy.dll)
+  endif()
   foreach(dll ${MINGW_RUNTIME_DLLS})
     if(EXISTS "${MINGW_BIN_DIR}/${dll}")
       add_custom_command(TARGET IridiScope POST_BUILD
@@ -178,4 +258,22 @@ if(MINGW)
         COMMENT "Copying ${dll}")
     endif()
   endforeach()
+endif()
+
+# Copy sdrplay_api.dll next to the executable so SDRplay devices work without
+# the API's bin directory on PATH.
+if(SDRPLAY_FOUND)
+  get_filename_component(SDRPLAY_LIB_DIR "${SDRPLAY_LIBRARY}" DIRECTORY)
+  find_file(SDRPLAY_RUNTIME NAMES sdrplay_api.dll
+    HINTS "${SDRPLAY_LIB_DIR}"
+          "$ENV{ProgramFiles}/SDRplay/API/${SDRPLAY_ARCH}"
+          "${SDRPLAY_API_ROOT}/${SDRPLAY_ARCH}")
+  if(SDRPLAY_RUNTIME)
+    add_custom_command(TARGET IridiScope POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${SDRPLAY_RUNTIME}" "$<TARGET_FILE_DIR:IridiScope>"
+      COMMENT "Copying sdrplay_api.dll")
+  else()
+    message(WARNING "sdrplay_api.dll not found; SDRplay devices need the API installed")
+  endif()
 endif()

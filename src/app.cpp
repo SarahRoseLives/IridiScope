@@ -10,9 +10,11 @@
 #include <cstdlib>
 #include <cstdarg>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <ctime>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -32,6 +34,7 @@
 
 #include "core/file_source.h"
 #include "core/engine.h"
+#include "sdr/live_iq_source.h"
 #include "ui/waterfall.h"
 #include "voice/audio.h"
 
@@ -45,14 +48,81 @@ GLFWwindow *g_window = nullptr;
 GLuint g_map_tex = 0;
 int g_map_w = 0, g_map_h = 0;
 
-iridi::IqFileSource g_source;
+iridi::IqFileSource g_file;
+iridi::LiveIqSource g_sdr(iridi::SdrKind::Sdrplay);
+iridi::LiveIqSource g_hackrf(iridi::SdrKind::HackRF);
+iridi::LiveIqSource g_airspy(iridi::SdrKind::Airspy);
 iridi::Engine g_engine;
 Waterfall g_waterfall;
 iridi::AudioPlayer g_audio;
 
+// Active input: 0 = IQ file, 1 = SDRplay, 2 = HackRF, 3 = Airspy.
+int g_source_kind = 0;
+iridi::IqSource *active_source() {
+    if (g_source_kind == 1) return (iridi::IqSource *)&g_sdr;
+    if (g_source_kind == 2) return (iridi::IqSource *)&g_hackrf;
+    if (g_source_kind == 3) return (iridi::IqSource *)&g_airspy;
+    return (iridi::IqSource *)&g_file;
+}
+
+// All SDRs are locked to the Iridium band.
+const double kIridiumCenterHz = 1623326935.0;
+
+// SDRplay sample rates.
+const double kSdrplayRates[] = {2.0e6, 3.0e6, 4.0e6, 5.0e6, 6.0e6, 7.0e6, 8.0e6, 9.0e6, 10.0e6};
+const char *kSdrplayRateLabels[] = {"2.0", "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0"};
+const int kNumSdrplayRates = (int)(sizeof(kSdrplayRates) / sizeof(kSdrplayRates[0]));
+int g_sdr_rate_idx = kNumSdrplayRates - 1; // 10 MHz
+int g_sdr_device_idx = 0;
+bool g_sdr_agc = true;
+float g_sdr_gr = 40.0f;
+bool g_sdr_bias = false;
+std::vector<iridi::SdrDeviceInfo> g_sdr_devices;
+std::mutex g_sdr_dev_mtx;
+std::atomic<bool> g_sdr_scanning{false};
+bool g_sdr_scan_requested = false;
+std::thread g_sdr_scan_thread;
+
+// HackRF sample rates (2..20 MSPS).
+const double kHackrfRates[] = {2.0e6, 4.0e6, 8.0e6, 10.0e6, 20.0e6};
+const char *kHackrfRateLabels[] = {"2.0", "4.0", "8.0", "10.0", "20.0"};
+const int kNumHackrfRates = (int)(sizeof(kHackrfRates) / sizeof(kHackrfRates[0]));
+int g_hrf_rate_idx = 3; // 10 MHz
+int g_hrf_device_idx = 0;
+int g_hrf_lna = 16; // 0..40, 8 dB steps
+int g_hrf_vga = 16; // 0..62, 2 dB steps
+bool g_hrf_amp = false;
+bool g_hrf_bias = false;
+std::vector<iridi::SdrDeviceInfo> g_hrf_devices;
+std::mutex g_hrf_dev_mtx;
+std::atomic<bool> g_hrf_scanning{false};
+bool g_hrf_scan_requested = false;
+std::thread g_hrf_scan_thread;
+
+// Airspy sample rates.
+const double kAirspyRates[] = {2.5e6, 3.0e6, 6.0e6, 10.0e6};
+const char *kAirspyRateLabels[] = {"2.5", "3.0", "6.0", "10.0"};
+const int kNumAirspyRates = (int)(sizeof(kAirspyRates) / sizeof(kAirspyRates[0]));
+int g_ap_rate_idx = 3; // 10 MHz
+int g_ap_device_idx = 0;
+int g_ap_gain_mode = 0; // 0=Sensitivity, 1=Linear, 2=Free
+int g_ap_sense = 10;    // 0..21
+int g_ap_linear = 10;   // 0..21
+int g_ap_lna = 8;       // 0..15 (free)
+int g_ap_mixer = 8;     // 0..15 (free)
+int g_ap_vga = 4;       // 0..15 (free)
+bool g_ap_lna_agc = false;
+bool g_ap_mixer_agc = false;
+bool g_ap_bias = false;
+std::vector<iridi::SdrDeviceInfo> g_ap_devices;
+std::mutex g_ap_dev_mtx;
+std::atomic<bool> g_ap_scanning{false};
+bool g_ap_scan_requested = false;
+std::thread g_ap_scan_thread;
+
 std::vector<std::string> g_log;
 bool g_show_map = true;
-bool g_show_source = false;
+bool g_show_source = true;
 bool g_show_spectrum = true;
 bool g_show_waterfall = true;
 bool g_show_stats = true;
@@ -133,12 +203,23 @@ void apply_spectrum_settings() {
     g_engine.set_dc_block(g_dc_block);
 }
 
+void start_engine() {
+    iridi::IqSource *src = active_source();
+    if (!src->is_open()) { add_log("ERROR: no source open"); return; }
+    if (g_engine.start(src)) { apply_spectrum_settings(); add_log("Engine started"); }
+    else add_log("ERROR: failed to start engine");
+}
+
 void open_iq_file(const std::string &path) {
     if (path.empty()) return;
     g_engine.stop();
+    g_sdr.close();
+    g_hackrf.close();
+    g_airspy.close();
+    g_source_kind = 0;
     std::string err;
-    if (!g_source.open(path, err)) { add_log("ERROR: %s", err.c_str()); return; }
-    const auto &in = g_source.info();
+    if (!g_file.open(path, err)) { add_log("ERROR: %s", err.c_str()); return; }
+    const auto &in = g_file.info();
     add_log("Opened %s", in.path.c_str());
     add_log("  format=%s rate=%d Hz samples=%llu duration=%.3f s center=%.0f Hz",
             iridi::iq_format_name(in.format), in.sample_rate,
@@ -148,10 +229,80 @@ void open_iq_file(const std::string &path) {
     g_spec_seq = 0;
     g_freq_mhz.clear();
 
-    if (g_auto_start) {
-        if (g_engine.start(&g_source)) { apply_spectrum_settings(); add_log("Engine started"); }
-        else add_log("ERROR: failed to start engine");
+    if (g_auto_start) start_engine();
+}
+
+void start_sdr() {
+    g_engine.stop();
+    g_file.close();
+    g_hackrf.close();
+    g_airspy.close();
+    g_source_kind = 1;
+    g_sdr.set_gain(g_sdr_agc ? -1.0 : (double)g_sdr_gr);
+    g_sdr.set_bias_tee(g_sdr_bias);
+    std::string err;
+    if (!g_sdr.open(g_sdr_device_idx, kIridiumCenterHz, kSdrplayRates[g_sdr_rate_idx], err)) {
+        add_log("ERROR: %s", err.c_str());
+        return;
     }
+    add_log("SDRplay started: %s @ %.6f MHz, %.1f Msps", g_sdr.device_name().c_str(),
+            kIridiumCenterHz / 1e6, kSdrplayRates[g_sdr_rate_idx] / 1e6);
+    g_waterfall.clear();
+    g_spec_seq = 0;
+    g_freq_mhz.clear();
+    start_engine();
+}
+
+void start_hackrf() {
+    g_engine.stop();
+    g_file.close();
+    g_sdr.close();
+    g_airspy.close();
+    g_source_kind = 2;
+    g_hackrf.set_lna_gain(g_hrf_lna);
+    g_hackrf.set_vga_gain(g_hrf_vga);
+    g_hackrf.set_amp(g_hrf_amp);
+    g_hackrf.set_bias_tee(g_hrf_bias);
+    std::string err;
+    if (!g_hackrf.open(g_hrf_device_idx, kIridiumCenterHz, kHackrfRates[g_hrf_rate_idx], err)) {
+        add_log("ERROR: %s", err.c_str());
+        return;
+    }
+    add_log("HackRF started: %s @ %.6f MHz, %.1f Msps (LNA %d, VGA %d, amp %s)",
+            g_hackrf.device_name().c_str(), kIridiumCenterHz / 1e6,
+            kHackrfRates[g_hrf_rate_idx] / 1e6, g_hrf_lna, g_hrf_vga, g_hrf_amp ? "on" : "off");
+    g_waterfall.clear();
+    g_spec_seq = 0;
+    g_freq_mhz.clear();
+    start_engine();
+}
+
+void start_airspy() {
+    g_engine.stop();
+    g_file.close();
+    g_sdr.close();
+    g_hackrf.close();
+    g_source_kind = 3;
+    g_airspy.set_gain_mode(g_ap_gain_mode);
+    g_airspy.set_sense_gain(g_ap_sense);
+    g_airspy.set_linear_gain(g_ap_linear);
+    g_airspy.set_lna_gain(g_ap_lna);
+    g_airspy.set_mixer_gain(g_ap_mixer);
+    g_airspy.set_vga_gain(g_ap_vga);
+    g_airspy.set_lna_agc(g_ap_lna_agc);
+    g_airspy.set_mixer_agc(g_ap_mixer_agc);
+    g_airspy.set_bias_tee(g_ap_bias);
+    std::string err;
+    if (!g_airspy.open(g_ap_device_idx, kIridiumCenterHz, kAirspyRates[g_ap_rate_idx], err)) {
+        add_log("ERROR: %s", err.c_str());
+        return;
+    }
+    add_log("Airspy started: %s @ %.6f MHz, %.1f Msps", g_airspy.device_name().c_str(),
+            kIridiumCenterHz / 1e6, kAirspyRates[g_ap_rate_idx] / 1e6);
+    g_waterfall.clear();
+    g_spec_seq = 0;
+    g_freq_mhz.clear();
+    start_engine();
 }
 
 // ---- panels ---------------------------------------------------------------
@@ -160,15 +311,15 @@ void draw_menu_bar() {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Open IQ file...", "Ctrl+O")) g_request_open = true;
-            if (ImGui::MenuItem("Close")) { g_engine.stop(); g_source.close(); g_waterfall.clear(); add_log("Closed source"); }
+            if (ImGui::MenuItem("Close")) { g_engine.stop(); g_file.close(); g_sdr.close(); g_waterfall.clear(); add_log("Closed source"); }
             ImGui::Separator();
             if (ImGui::MenuItem("Quit", "Alt+F4")) glfwSetWindowShouldClose(g_window, 1);
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Playback")) {
             bool running = g_engine.running();
-            if (ImGui::MenuItem("Start", nullptr, false, g_source.is_open() && !running)) {
-                if (g_engine.start(&g_source)) { apply_spectrum_settings(); add_log("Engine started"); }
+            if (ImGui::MenuItem("Start", nullptr, false, active_source()->is_open() && !running)) {
+                start_engine();
             }
             if (ImGui::MenuItem(g_engine.paused() ? "Resume" : "Pause", nullptr, false, running))
                 g_engine.set_paused(!g_engine.paused());
@@ -310,8 +461,8 @@ void draw_playback_window() {
     if (ImGui::Begin("Playback")) {
         bool running = g_engine.running();
         if (!running) {
-            ImGui::BeginDisabled(!g_source.is_open());
-            if (ImGui::Button("Start")) { if (g_engine.start(&g_source)) { apply_spectrum_settings(); } }
+            ImGui::BeginDisabled(!active_source()->is_open());
+            if (ImGui::Button("Start")) start_engine();
             ImGui::EndDisabled();
         } else {
             if (ImGui::Button(g_engine.paused() ? "Resume" : "Pause")) g_engine.set_paused(!g_engine.paused());
@@ -323,10 +474,15 @@ void draw_playback_window() {
         if (ImGui::Checkbox("1x realtime", &rt)) g_engine.set_realtime(rt);
 
         iridi::EngineStats s = g_engine.stats();
-        float frac = s.total_samples ? (float)((double)s.samples / (double)s.total_samples) : 0.0f;
         char overlay[64];
-        snprintf(overlay, sizeof(overlay), "%.1f%% (%.1f s)", frac * 100.0f, s.elapsed_s);
-        ImGui::ProgressBar(frac, ImVec2(-1, 0), overlay);
+        if (s.total_samples) {
+            float frac = (float)((double)s.samples / (double)s.total_samples);
+            snprintf(overlay, sizeof(overlay), "%.1f%% (%.1f s)", frac * 100.0f, s.elapsed_s);
+            ImGui::ProgressBar(frac, ImVec2(-1, 0), overlay);
+        } else {
+            snprintf(overlay, sizeof(overlay), "live (%.1f s)", s.elapsed_s);
+            ImGui::ProgressBar(0.0f, ImVec2(-1, 0), overlay);
+        }
         if (s.done) ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "Done");
     }
     ImGui::End();
@@ -396,8 +552,8 @@ void draw_spectrum_window() {
         }
         if ((int)g_freq_mhz.size() != N) {
             g_freq_mhz.resize(N);
-            double fc = g_source.info().center_frequency;
-            double fs = g_source.info().sample_rate ? g_source.info().sample_rate : 1.0;
+            double fc = active_source()->center_frequency();
+            double fs = active_source()->sample_rate() ? active_source()->sample_rate() : 1.0;
             for (int i = 0; i < N; i++)
                 g_freq_mhz[i] = (float)((fc + ((double)i - N / 2) * fs / N) / 1e6);
         }
@@ -572,34 +728,326 @@ void draw_voice_window() {
     ImGui::End();
 }
 
+void request_scan(iridi::LiveIqSource &sdr, std::vector<iridi::SdrDeviceInfo> &devs,
+                  std::mutex &mtx, std::atomic<bool> &scanning, std::thread &th) {
+    if (scanning.load()) return;
+    if (th.joinable()) th.join();
+    scanning.store(true);
+    th = std::thread([&sdr, &devs, &mtx, &scanning] {
+        std::vector<iridi::SdrDeviceInfo> d = sdr.list_devices();
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            devs = std::move(d);
+        }
+        scanning.store(false);
+    });
+}
+
+void request_sdr_device_scan() {
+    g_sdr_scan_requested = true;
+    request_scan(g_sdr, g_sdr_devices, g_sdr_dev_mtx, g_sdr_scanning, g_sdr_scan_thread);
+}
+
+void request_hrf_device_scan() {
+    g_hrf_scan_requested = true;
+    request_scan(g_hackrf, g_hrf_devices, g_hrf_dev_mtx, g_hrf_scanning, g_hrf_scan_thread);
+}
+
+void request_ap_device_scan() {
+    g_ap_scan_requested = true;
+    request_scan(g_airspy, g_ap_devices, g_ap_dev_mtx, g_ap_scanning, g_ap_scan_thread);
+}
+
+void draw_sdr_source_controls() {
+    // Kick a device scan the first time the SDR source is shown.
+    if (g_sdr_devices.empty() && !g_sdr_scanning.load() && !g_sdr_scan_requested)
+        request_sdr_device_scan();
+
+    std::vector<iridi::SdrDeviceInfo> devs;
+    {
+        std::lock_guard<std::mutex> lk(g_sdr_dev_mtx);
+        devs = g_sdr_devices;
+    }
+
+    bool running = g_engine.running();
+    const bool scanning = g_sdr_scanning.load();
+
+    if (scanning) {
+        ImGui::TextDisabled("Scanning for SDRplay devices...");
+    } else if (devs.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "No SDRplay device found.");
+    } else {
+        std::vector<const char *> names;
+        names.reserve(devs.size());
+        for (auto &d : devs) names.push_back(d.name.c_str());
+        ImGui::SetNextItemWidth(200);
+        ImGui::Combo("Device", &g_sdr_device_idx, names.data(), (int)names.size());
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(scanning);
+    if (ImGui::Button("Refresh")) request_sdr_device_scan();
+    ImGui::EndDisabled();
+
+    ImGui::BeginDisabled(running);
+    ImGui::SetNextItemWidth(200);
+    if (ImGui::Combo("Sample rate (Msps)", &g_sdr_rate_idx, kSdrplayRateLabels, kNumSdrplayRates)) {
+        if (g_sdr.is_open()) g_sdr.set_sample_rate(kSdrplayRates[g_sdr_rate_idx]);
+    }
+    ImGui::EndDisabled();
+
+    ImGui::Text("Center: %.6f MHz (locked)", kIridiumCenterHz / 1e6);
+
+    if (ImGui::Checkbox("AGC", &g_sdr_agc)) {
+        if (running) g_sdr.set_gain(g_sdr_agc ? -1.0 : (double)g_sdr_gr);
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(g_sdr_agc);
+    ImGui::SetNextItemWidth(180);
+    if (ImGui::SliderFloat("Gain reduction (dB)", &g_sdr_gr, 20.0f, 59.0f, "%.0f")) {
+        if (running) g_sdr.set_gain((double)g_sdr_gr);
+    }
+    ImGui::EndDisabled();
+
+    if (ImGui::Checkbox("Bias tee", &g_sdr_bias)) g_sdr.set_bias_tee(g_sdr_bias);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(powers an inline LNA/antenna)");
+
+#ifndef HAS_SDRPLAY
+    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f),
+                       "SDRplay support not compiled in (API not found at build time).");
+    ImGui::BeginDisabled();
+#endif
+    if (!g_sdr.is_open()) {
+        ImGui::BeginDisabled(devs.empty() || scanning);
+        if (ImGui::Button("Start SDRplay")) start_sdr();
+        ImGui::EndDisabled();
+    } else {
+        if (ImGui::Button("Stop SDRplay")) {
+            g_engine.stop();
+            g_sdr.close();
+            add_log("SDRplay stopped");
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "streaming: %s", g_sdr.device_name().c_str());
+    }
+#ifndef HAS_SDRPLAY
+    ImGui::EndDisabled();
+#endif
+}
+
+void draw_hackrf_source_controls() {
+    if (g_hrf_devices.empty() && !g_hrf_scanning.load() && !g_hrf_scan_requested)
+        request_hrf_device_scan();
+
+    std::vector<iridi::SdrDeviceInfo> devs;
+    {
+        std::lock_guard<std::mutex> lk(g_hrf_dev_mtx);
+        devs = g_hrf_devices;
+    }
+    bool running = g_engine.running();
+    const bool scanning = g_hrf_scanning.load();
+
+    if (scanning) {
+        ImGui::TextDisabled("Scanning for HackRF devices...");
+    } else if (devs.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "No HackRF device found.");
+    } else {
+        std::vector<const char *> names;
+        names.reserve(devs.size());
+        for (auto &d : devs) names.push_back(d.name.c_str());
+        ImGui::SetNextItemWidth(200);
+        ImGui::Combo("Device", &g_hrf_device_idx, names.data(), (int)names.size());
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(scanning);
+    if (ImGui::Button("Refresh")) request_hrf_device_scan();
+    ImGui::EndDisabled();
+
+    ImGui::BeginDisabled(running);
+    ImGui::SetNextItemWidth(200);
+    if (ImGui::Combo("Sample rate (Msps)", &g_hrf_rate_idx, kHackrfRateLabels, kNumHackrfRates)) {
+        if (g_hackrf.is_open()) g_hackrf.set_sample_rate(kHackrfRates[g_hrf_rate_idx]);
+    }
+    ImGui::EndDisabled();
+
+    ImGui::Text("Center: %.6f MHz (locked)", kIridiumCenterHz / 1e6);
+
+    ImGui::SetNextItemWidth(200);
+    if (ImGui::SliderInt("IF/LNA gain (dB)", &g_hrf_lna, 0, 40, "%d"))
+        g_hackrf.set_lna_gain(g_hrf_lna);
+    ImGui::SetNextItemWidth(200);
+    if (ImGui::SliderInt("Baseband/VGA gain (dB)", &g_hrf_vga, 0, 62, "%d"))
+        g_hackrf.set_vga_gain(g_hrf_vga);
+    if (ImGui::Checkbox("RF amp (+11 dB)", &g_hrf_amp)) g_hackrf.set_amp(g_hrf_amp);
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Bias tee", &g_hrf_bias)) g_hackrf.set_bias_tee(g_hrf_bias);
+
+#ifndef HAS_HACKRF
+    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f),
+                       "HackRF support not compiled in (libhackrf not found at build time).");
+    ImGui::BeginDisabled();
+#endif
+    if (!g_hackrf.is_open()) {
+        ImGui::BeginDisabled(devs.empty() || scanning);
+        if (ImGui::Button("Start HackRF")) start_hackrf();
+        ImGui::EndDisabled();
+    } else {
+        if (ImGui::Button("Stop HackRF")) {
+            g_engine.stop();
+            g_hackrf.close();
+            add_log("HackRF stopped");
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "streaming: %s",
+                           g_hackrf.device_name().c_str());
+    }
+#ifndef HAS_HACKRF
+    ImGui::EndDisabled();
+#endif
+}
+
+void draw_airspy_source_controls() {
+    if (g_ap_devices.empty() && !g_ap_scanning.load() && !g_ap_scan_requested)
+        request_ap_device_scan();
+
+    std::vector<iridi::SdrDeviceInfo> devs;
+    {
+        std::lock_guard<std::mutex> lk(g_ap_dev_mtx);
+        devs = g_ap_devices;
+    }
+    bool running = g_engine.running();
+    const bool scanning = g_ap_scanning.load();
+
+    if (scanning) {
+        ImGui::TextDisabled("Scanning for Airspy devices...");
+    } else if (devs.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "No Airspy device found.");
+    } else {
+        std::vector<const char *> names;
+        names.reserve(devs.size());
+        for (auto &d : devs) names.push_back(d.name.c_str());
+        ImGui::SetNextItemWidth(200);
+        ImGui::Combo("Device", &g_ap_device_idx, names.data(), (int)names.size());
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(scanning);
+    if (ImGui::Button("Refresh")) request_ap_device_scan();
+    ImGui::EndDisabled();
+
+    ImGui::BeginDisabled(running);
+    ImGui::SetNextItemWidth(200);
+    if (ImGui::Combo("Sample rate (Msps)", &g_ap_rate_idx, kAirspyRateLabels, kNumAirspyRates)) {
+        if (g_airspy.is_open()) g_airspy.set_sample_rate(kAirspyRates[g_ap_rate_idx]);
+    }
+    ImGui::EndDisabled();
+
+    ImGui::Text("Center: %.6f MHz (locked)", kIridiumCenterHz / 1e6);
+
+    const char *modes[] = {"Sensitivity", "Linear", "Free"};
+    ImGui::SetNextItemWidth(200);
+    if (ImGui::Combo("Gain mode", &g_ap_gain_mode, modes, 3))
+        g_airspy.set_gain_mode(g_ap_gain_mode);
+
+    if (g_ap_gain_mode == 0) {
+        ImGui::SetNextItemWidth(200);
+        if (ImGui::SliderInt("Sensitivity gain", &g_ap_sense, 0, 21, "%d"))
+            g_airspy.set_sense_gain(g_ap_sense);
+    } else if (g_ap_gain_mode == 1) {
+        ImGui::SetNextItemWidth(200);
+        if (ImGui::SliderInt("Linearity gain", &g_ap_linear, 0, 21, "%d"))
+            g_airspy.set_linear_gain(g_ap_linear);
+    } else {
+        if (ImGui::Checkbox("LNA AGC", &g_ap_lna_agc)) g_airspy.set_lna_agc(g_ap_lna_agc);
+        ImGui::BeginDisabled(g_ap_lna_agc);
+        ImGui::SetNextItemWidth(200);
+        if (ImGui::SliderInt("LNA gain", &g_ap_lna, 0, 15, "%d")) g_airspy.set_lna_gain(g_ap_lna);
+        ImGui::EndDisabled();
+        if (ImGui::Checkbox("Mixer AGC", &g_ap_mixer_agc)) g_airspy.set_mixer_agc(g_ap_mixer_agc);
+        ImGui::BeginDisabled(g_ap_mixer_agc);
+        ImGui::SetNextItemWidth(200);
+        if (ImGui::SliderInt("Mixer gain", &g_ap_mixer, 0, 15, "%d"))
+            g_airspy.set_mixer_gain(g_ap_mixer);
+        ImGui::EndDisabled();
+        ImGui::SetNextItemWidth(200);
+        if (ImGui::SliderInt("VGA gain", &g_ap_vga, 0, 15, "%d")) g_airspy.set_vga_gain(g_ap_vga);
+    }
+    if (ImGui::Checkbox("Bias tee", &g_ap_bias)) g_airspy.set_bias_tee(g_ap_bias);
+
+#ifndef HAS_AIRSPY
+    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f),
+                       "Airspy support not compiled in (libairspy not found at build time).");
+    ImGui::BeginDisabled();
+#endif
+    if (!g_airspy.is_open()) {
+        ImGui::BeginDisabled(devs.empty() || scanning);
+        if (ImGui::Button("Start Airspy")) start_airspy();
+        ImGui::EndDisabled();
+    } else {
+        if (ImGui::Button("Stop Airspy")) {
+            g_engine.stop();
+            g_airspy.close();
+            add_log("Airspy stopped");
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "streaming: %s",
+                           g_airspy.device_name().c_str());
+    }
+#ifndef HAS_AIRSPY
+    ImGui::EndDisabled();
+#endif
+}
+
 void draw_source_window() {
     if (!g_show_source) return;
-    ImGui::SetNextWindowSize(ImVec2(520, 260), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(520, 300), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Source", &g_show_source)) {
-        if (!g_source.is_open()) {
-            ImGui::TextDisabled("No IQ file loaded.");
-            if (ImGui::Button("Open IQ file...")) g_request_open = true;
-            ImGui::End();
-            return;
+        const char *kinds[] = {"IQ file", "SDRplay", "HackRF", "Airspy"};
+        ImGui::SetNextItemWidth(160);
+        if (ImGui::Combo("Source", &g_source_kind, kinds, 4)) {
+            g_engine.stop();
+            g_file.close();
+            g_sdr.close();
+            g_hackrf.close();
+            g_airspy.close();
+            g_freq_mhz.clear();
+            if (g_source_kind == 1) g_sdr_scan_requested = false; // allow a fresh scan
+            if (g_source_kind == 2) g_hrf_scan_requested = false;
+            if (g_source_kind == 3) g_ap_scan_requested = false;
         }
-        const auto &in = g_source.info();
-        ImGui::TextWrapped("%s", in.path.c_str());
         ImGui::Separator();
-        if (ImGui::BeginTable("info", 2, ImGuiTableFlags_SizingStretchProp)) {
-            auto row = [](const char *k, const char *fmt, ...) {
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(k);
-                ImGui::TableSetColumnIndex(1);
-                char b[256]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof(b), fmt, ap); va_end(ap);
-                ImGui::TextUnformatted(b);
-            };
-            row("Format", "%s", iridi::iq_format_name(in.format));
-            row("Container", "%s", in.is_wav ? "WAV (RIFF)" : "raw");
-            row("Sample rate", "%d Hz", in.sample_rate);
-            row("Complex samples", "%llu", (unsigned long long)in.num_samples);
-            row("Duration", "%.3f s", in.duration_s);
-            if (in.center_frequency > 0) row("Center freq", "%.0f Hz", in.center_frequency);
-            ImGui::EndTable();
+
+        if (g_source_kind == 0) {
+            if (!g_file.is_open()) {
+                ImGui::TextDisabled("No IQ file loaded.");
+                if (ImGui::Button("Open IQ file...")) g_request_open = true;
+            } else {
+                const auto &in = g_file.info();
+                ImGui::TextWrapped("%s", in.path.c_str());
+                ImGui::Separator();
+                if (ImGui::BeginTable("info", 2, ImGuiTableFlags_SizingStretchProp)) {
+                    auto row = [](const char *k, const char *fmt, ...) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(k);
+                        ImGui::TableSetColumnIndex(1);
+                        char b[256]; va_list ap; va_start(ap, fmt);
+                        vsnprintf(b, sizeof(b), fmt, ap); va_end(ap);
+                        ImGui::TextUnformatted(b);
+                    };
+                    row("Format", "%s", iridi::iq_format_name(in.format));
+                    row("Container", "%s", in.is_wav ? "WAV (RIFF)" : "raw");
+                    row("Sample rate", "%d Hz", in.sample_rate);
+                    row("Complex samples", "%llu", (unsigned long long)in.num_samples);
+                    row("Duration", "%.3f s", in.duration_s);
+                    if (in.center_frequency > 0) row("Center freq", "%.0f Hz", in.center_frequency);
+                    ImGui::EndTable();
+                }
+            }
+        } else if (g_source_kind == 1) {
+            draw_sdr_source_controls();
+        } else if (g_source_kind == 2) {
+            draw_hackrf_source_controls();
+        } else {
+            draw_airspy_source_controls();
         }
     }
     ImGui::End();
@@ -731,6 +1179,68 @@ static int parse_raw_file(const char *path) {
 
 namespace irid { extern int irid_debug; }
 
+static int sdr_list_devices() {
+    iridi::LiveIqSource sdr(iridi::SdrKind::Sdrplay);
+    if (!sdr.available()) { printf("SDRplay support not compiled in\n"); return 1; }
+    auto devs = sdr.list_devices();
+    printf("sdrplay_devices=%zu\n", devs.size());
+    for (auto &d : devs) printf("  [%d] %s  sn=%s\n", d.index, d.name.c_str(), d.serial.c_str());
+    return 0;
+}
+
+static int hrf_list_devices() {
+    iridi::LiveIqSource hrf(iridi::SdrKind::HackRF);
+    if (!hrf.available()) { printf("HackRF support not compiled in\n"); return 1; }
+    auto devs = hrf.list_devices();
+    printf("hackrf_devices=%zu\n", devs.size());
+    for (auto &d : devs) printf("  [%d] %s  sn=%s\n", d.index, d.name.c_str(), d.serial.c_str());
+    return 0;
+}
+
+static int ap_list_devices() {
+    iridi::LiveIqSource ap(iridi::SdrKind::Airspy);
+    if (!ap.available()) { printf("Airspy support not compiled in\n"); return 1; }
+    auto devs = ap.list_devices();
+    printf("airspy_devices=%zu\n", devs.size());
+    for (auto &d : devs) printf("  [%d] %s  sn=%s\n", d.index, d.name.c_str(), d.serial.c_str());
+    return 0;
+}
+
+static int scan_live(iridi::SdrKind kind, double seconds, double rate_hz) {
+    iridi::LiveIqSource sdr(kind);
+    const char *label = (kind == iridi::SdrKind::HackRF) ? "HackRF" : "SDRplay";
+    if (!sdr.available()) { fprintf(stderr, "%s support not compiled in\n", label); return 2; }
+    std::string err;
+    if (!sdr.open(0, 1623326935.0, rate_hz, err)) {
+        fprintf(stderr, "%s open failed: %s\n", label, err.c_str());
+        return 3;
+    }
+    iridi::Engine eng;
+    if (!eng.start(&sdr)) { fprintf(stderr, "engine start failed\n"); sdr.close(); return 4; }
+    auto t0 = std::chrono::steady_clock::now();
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < seconds) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    auto s = eng.stats();
+    printf("samples=%llu\nbursts=%llu\nframes_ok=%llu\nframes_fail=%llu\n",
+           (unsigned long long)s.samples, (unsigned long long)s.bursts,
+           (unsigned long long)s.frames_ok, (unsigned long long)s.frames_fail);
+    printf("parsed=%llu\nparse_errors=%llu\nsatellites=%zu\nmessages=%zu\n",
+           (unsigned long long)eng.parsed_count(), (unsigned long long)eng.parse_error_count(),
+           eng.satellites().size(), eng.recent_messages(100000).size());
+    auto vc = eng.voices().calls();
+    int good = 0; size_t withpcm = 0;
+    for (auto &c : vc) { if (c.error_ratio < 0.5) good++; if (!eng.voices().pcm(c.id).empty()) withpcm++; }
+    printf("voice_calls=%zu voice_good=%d voice_with_audio=%zu\n", vc.size(), good, withpcm);
+    printf("acars_messages=%zu sbd_packets=%llu ida_assembled=%llu\n",
+           eng.acars().messages().size(),
+           (unsigned long long)eng.acars().sbd_packets(),
+           (unsigned long long)eng.acars().ida_assembled());
+    eng.stop();
+    sdr.close();
+    return 0;
+}
+
 static int parse_frames_debug(const char *path) {
     irid::irid_debug = 1;
     FILE *f = fopen(path, "r");
@@ -774,9 +1284,23 @@ static void attach_console() {
 int main(int argc, char **argv) {
     if (argc >= 2) {
         std::string a1 = argv[1];
-        if (a1 == "--info" || a1 == "--parse" || a1 == "--frame" || a1 == "--scan")
+        if (a1 == "--info" || a1 == "--parse" || a1 == "--frame" || a1 == "--scan" ||
+            a1 == "--sdr-list" || a1 == "--sdr-scan" || a1 == "--hrf-list" || a1 == "--hrf-scan" ||
+            a1 == "--ap-list" || a1 == "--ap-scan")
             attach_console();
     }
+    if (argc >= 2 && std::string(argv[1]) == "--sdr-list") return sdr_list_devices();
+    if (argc >= 2 && std::string(argv[1]) == "--hrf-list") return hrf_list_devices();
+    if (argc >= 2 && std::string(argv[1]) == "--ap-list") return ap_list_devices();
+    if (argc >= 2 && std::string(argv[1]) == "--sdr-scan")
+        return scan_live(iridi::SdrKind::Sdrplay, argc >= 3 ? atof(argv[2]) : 10.0,
+                         argc >= 4 ? atof(argv[3]) : 2000000.0);
+    if (argc >= 2 && std::string(argv[1]) == "--hrf-scan")
+        return scan_live(iridi::SdrKind::HackRF, argc >= 3 ? atof(argv[2]) : 10.0,
+                         argc >= 4 ? atof(argv[3]) : 10000000.0);
+    if (argc >= 2 && std::string(argv[1]) == "--ap-scan")
+        return scan_live(iridi::SdrKind::Airspy, argc >= 3 ? atof(argv[2]) : 10.0,
+                         argc >= 4 ? atof(argv[3]) : 10000000.0);
     if (argc >= 3 && std::string(argv[1]) == "--info") return print_file_info(argv[2]);
     if (argc >= 3 && std::string(argv[1]) == "--parse") return parse_raw_file(argv[2]);
     if (argc >= 3 && std::string(argv[1]) == "--frame") return parse_frames_debug(argv[2]);
@@ -878,6 +1402,12 @@ int main(int argc, char **argv) {
     }
 
     g_engine.stop();
+    g_sdr.close();
+    g_hackrf.close();
+    g_airspy.close();
+    if (g_sdr_scan_thread.joinable()) g_sdr_scan_thread.join();
+    if (g_hrf_scan_thread.joinable()) g_hrf_scan_thread.join();
+    if (g_ap_scan_thread.joinable()) g_ap_scan_thread.join();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImPlot::DestroyContext();

@@ -56,7 +56,7 @@ public:
     Engine() = default;
     ~Engine();
 
-    bool start(IqFileSource *source, float threshold = 16.0f);
+    bool start(IqSource *source, float threshold = 16.0f);
     void stop();
 
     bool running() const { return running_.load(); }
@@ -100,7 +100,7 @@ public:
 private:
     void thread_main();
 
-    IqFileSource *source_ = nullptr;
+    IqSource *source_ = nullptr;
     void *pipe_ = nullptr; // ir_pipeline_t*
     std::thread thread_;
 

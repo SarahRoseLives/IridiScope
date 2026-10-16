@@ -1,0 +1,889 @@
+// IridiScope - Iridium signal analysis workstation.
+//
+// Milestone 2: the vendored DSP pipeline runs over the IQ file and drives a
+// live spectrum (ImPlot), scrolling waterfall, and burst statistics.
+#include <windows.h>
+#include <commdlg.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdarg>
+#include <algorithm>
+#include <chrono>
+#include <ctime>
+#include <map>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <GLFW/glfw3.h>
+#include <GL/gl.h>
+
+#include "imgui.h"
+#include "imgui_internal.h"
+#include "implot.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb/stb_image.h"
+
+#include "core/file_source.h"
+#include "core/engine.h"
+#include "ui/waterfall.h"
+#include "voice/audio.h"
+
+#ifndef IRIDISCOPE_ASSETS
+#define IRIDISCOPE_ASSETS "assets"
+#endif
+
+namespace {
+
+GLFWwindow *g_window = nullptr;
+GLuint g_map_tex = 0;
+int g_map_w = 0, g_map_h = 0;
+
+iridi::IqFileSource g_source;
+iridi::Engine g_engine;
+Waterfall g_waterfall;
+iridi::AudioPlayer g_audio;
+
+std::vector<std::string> g_log;
+bool g_show_map = true;
+bool g_show_source = false;
+bool g_show_spectrum = true;
+bool g_show_waterfall = true;
+bool g_show_stats = true;
+bool g_show_bursts = false;
+bool g_show_messages = true;
+bool g_show_sats = true;
+bool g_show_voice = true;
+bool g_show_acars = true;
+int g_selected_voice = -1;
+int g_voice_cache_id = -1;
+std::vector<int16_t> g_voice_cache;
+bool g_request_open = false;
+bool g_auto_start = true;
+
+// Spectrum configuration.
+const int kFftSizes[] = {1024, 2048, 4096, 8192, 16384, 32768, 65536};
+const char *kFftLabels[] = {"1024", "2048", "4096", "8192", "16384", "32768", "65536"};
+const int kNumFftSizes = (int)(sizeof(kFftSizes) / sizeof(kFftSizes[0]));
+int g_fft_idx = 2;              // default 4096
+float g_avg_alpha = 0.6f;
+float g_db_min = -80.0f;
+float g_db_max = 0.0f;
+bool g_autoscale = true;
+bool g_dc_block = true;
+
+uint64_t g_spec_seq = 0;
+std::vector<float> g_freq_mhz;
+
+void add_log(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    g_log.emplace_back(buf);
+    fprintf(stdout, "%s\n", buf);
+    fflush(stdout);
+    if (g_log.size() > 2000) g_log.erase(g_log.begin(), g_log.begin() + 500);
+}
+
+GLuint load_texture(const std::string &path, int &out_w, int &out_h) {
+    int w = 0, h = 0, comp = 0;
+    unsigned char *pixels = stbi_load(path.c_str(), &w, &h, &comp, 4);
+    if (!pixels) { add_log("Failed to load texture: %s", path.c_str()); return 0; }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    stbi_image_free(pixels);
+    out_w = w; out_h = h;
+    add_log("Loaded map texture %dx%d from %s", w, h, path.c_str());
+    return tex;
+}
+
+std::string open_file_dialog() {
+    char filename[MAX_PATH] = {0};
+    OPENFILENAMEA ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter =
+        "IQ files (*.wav;*.cf32;*.ci16;*.ci8;*.cfile;*.raw)\0"
+        "*.wav;*.cf32;*.ci16;*.ci8;*.cfile;*.raw\0"
+        "All files (*.*)\0*.*\0";
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameA(&ofn)) return std::string(filename);
+    return std::string();
+}
+
+void apply_spectrum_settings() {
+    g_engine.set_fft_size(kFftSizes[g_fft_idx]);
+    g_engine.set_avg_alpha(g_avg_alpha);
+    g_engine.set_dc_block(g_dc_block);
+}
+
+void open_iq_file(const std::string &path) {
+    if (path.empty()) return;
+    g_engine.stop();
+    std::string err;
+    if (!g_source.open(path, err)) { add_log("ERROR: %s", err.c_str()); return; }
+    const auto &in = g_source.info();
+    add_log("Opened %s", in.path.c_str());
+    add_log("  format=%s rate=%d Hz samples=%llu duration=%.3f s center=%.0f Hz",
+            iridi::iq_format_name(in.format), in.sample_rate,
+            (unsigned long long)in.num_samples, in.duration_s, in.center_frequency);
+
+    g_waterfall.clear();
+    g_spec_seq = 0;
+    g_freq_mhz.clear();
+
+    if (g_auto_start) {
+        if (g_engine.start(&g_source)) { apply_spectrum_settings(); add_log("Engine started"); }
+        else add_log("ERROR: failed to start engine");
+    }
+}
+
+// ---- panels ---------------------------------------------------------------
+
+void draw_menu_bar() {
+    if (ImGui::BeginMainMenuBar()) {
+        if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("Open IQ file...", "Ctrl+O")) g_request_open = true;
+            if (ImGui::MenuItem("Close")) { g_engine.stop(); g_source.close(); g_waterfall.clear(); add_log("Closed source"); }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Quit", "Alt+F4")) glfwSetWindowShouldClose(g_window, 1);
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Playback")) {
+            bool running = g_engine.running();
+            if (ImGui::MenuItem("Start", nullptr, false, g_source.is_open() && !running)) {
+                if (g_engine.start(&g_source)) { apply_spectrum_settings(); add_log("Engine started"); }
+            }
+            if (ImGui::MenuItem(g_engine.paused() ? "Resume" : "Pause", nullptr, false, running))
+                g_engine.set_paused(!g_engine.paused());
+            if (ImGui::MenuItem("Stop", nullptr, false, running)) g_engine.stop();
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("View")) {
+            ImGui::MenuItem("Map", nullptr, &g_show_map);
+            ImGui::MenuItem("Spectrum", nullptr, &g_show_spectrum);
+            ImGui::MenuItem("Waterfall", nullptr, &g_show_waterfall);
+            ImGui::MenuItem("Stats", nullptr, &g_show_stats);
+            ImGui::MenuItem("Bursts", nullptr, &g_show_bursts);
+            ImGui::MenuItem("Messages", nullptr, &g_show_messages);
+            ImGui::MenuItem("Satellites", nullptr, &g_show_sats);
+            ImGui::MenuItem("Voice", nullptr, &g_show_voice);
+            ImGui::MenuItem("ACARS", nullptr, &g_show_acars);
+            ImGui::MenuItem("Source", nullptr, &g_show_source);
+            ImGui::EndMenu();
+        }
+        ImGui::EndMainMenuBar();
+    }
+}
+
+void project_to_map(double lat, double lon, const ImVec2 &pos, const ImVec2 &size, ImVec2 &out) {
+    out.x = pos.x + (float)((lon + 180.0) / 360.0 * size.x);
+    out.y = pos.y + (float)((90.0 - lat) / 180.0 * size.y);
+}
+
+void draw_map_window() {
+    if (!g_show_map) return;
+    ImGui::SetNextWindowSize(ImVec2(900, 500), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Map", &g_show_map)) {
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        if (avail.x < 16 || avail.y < 16) { ImGui::End(); return; }
+        float aspect = (g_map_h > 0) ? (float)g_map_w / (float)g_map_h : 2.0f;
+        ImVec2 size = avail;
+        if (size.x / size.y > aspect) size.x = size.y * aspect; else size.y = size.x / aspect;
+        ImVec2 pos = ImGui::GetCursorScreenPos();
+        if (g_map_tex) ImGui::Image((ImTextureID)(uintptr_t)g_map_tex, size);
+        else { ImGui::Dummy(size); ImGui::GetWindowDrawList()->AddRectFilled(pos,
+                 ImVec2(pos.x + size.x, pos.y + size.y), IM_COL32(20, 30, 40, 255)); }
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        ImU32 grid = IM_COL32(255, 255, 255, 40);
+        ImVec2 a;
+        for (int lon = -180; lon <= 180; lon += 30) { project_to_map(0, lon, pos, size, a);
+            dl->AddLine(ImVec2(a.x, pos.y), ImVec2(a.x, pos.y + size.y), grid); }
+        for (int lat = -90; lat <= 90; lat += 30) { project_to_map(lat, 0, pos, size, a);
+            dl->AddLine(ImVec2(pos.x, a.y), ImVec2(pos.x + size.x, a.y), grid); }
+        dl->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y), IM_COL32(255, 255, 255, 90));
+
+        // Satellites (from decoded ring alerts / broadcasts).
+        for (const auto &s : g_engine.satellites()) {
+            if (!s.has_pos || s.lat < -90.0 || s.lat > 90.0) continue;
+            ImVec2 pt;
+            project_to_map(s.lat, s.lon, pos, size, pt);
+            dl->AddCircleFilled(pt, 4.0f, IM_COL32(255, 170, 0, 230));
+            dl->AddCircle(pt, 7.0f, IM_COL32(255, 255, 0, 140), 0, 1.5f);
+            char lbl[16];
+            snprintf(lbl, sizeof(lbl), "S%03d", s.id);
+            dl->AddText(ImVec2(pt.x + 7, pt.y - 7), IM_COL32(255, 255, 140, 255), lbl);
+        }
+    }
+    ImGui::End();
+}
+
+void draw_satellites_window() {
+    if (!g_show_sats) return;
+    ImGui::SetNextWindowSize(ImVec2(420, 240), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Satellites", &g_show_sats)) {
+        auto sats = g_engine.satellites();
+        ImGui::TextDisabled("%zu satellites", sats.size());
+        if (ImGui::BeginTable("sats", 6,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
+                ImVec2(0, 0))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Sat");
+            ImGui::TableSetupColumn("Lat");
+            ImGui::TableSetupColumn("Lon");
+            ImGui::TableSetupColumn("Alt km");
+            ImGui::TableSetupColumn("Beam");
+            ImGui::TableSetupColumn("Hits");
+            ImGui::TableHeadersRow();
+            for (const auto &s : sats) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::Text("%03d", s.id);
+                ImGui::TableSetColumnIndex(1);
+                if (s.has_pos) ImGui::Text("%+.2f", s.lat); else ImGui::TextUnformatted("-");
+                ImGui::TableSetColumnIndex(2);
+                if (s.has_pos) ImGui::Text("%+.2f", s.lon); else ImGui::TextUnformatted("-");
+                ImGui::TableSetColumnIndex(3);
+                if (s.has_pos) ImGui::Text("%d", s.alt_km); else ImGui::TextUnformatted("-");
+                ImGui::TableSetColumnIndex(4); ImGui::Text("%d", s.beam);
+                ImGui::TableSetColumnIndex(5); ImGui::Text("%d", s.count);
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+}
+
+void draw_messages_window() {
+    if (!g_show_messages) return;
+    ImGui::SetNextWindowSize(ImVec2(820, 280), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Messages", &g_show_messages)) {
+        auto msgs = g_engine.recent_messages(1000);
+        ImGui::TextDisabled("%zu recent parsed messages", msgs.size());
+        if (ImGui::BeginTable("msgs", 4,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
+                ImVec2(0, 0))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 52);
+            ImGui::TableSetupColumn("Freq (Hz)", ImGuiTableColumnFlags_WidthFixed, 96);
+            ImGui::TableSetupColumn("Sat", ImGuiTableColumnFlags_WidthFixed, 40);
+            ImGui::TableSetupColumn("Detail", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            for (auto it = msgs.rbegin(); it != msgs.rend(); ++it) {
+                const auto &m = *it;
+                ImGui::TableNextRow();
+                ImVec4 col = m.error ? ImVec4(0.6f, 0.6f, 0.6f, 1.0f)
+                    : (m.type == "IRA" ? ImVec4(1.0f, 0.8f, 0.3f, 1.0f)
+                    : (m.has_ida ? ImVec4(0.5f, 0.9f, 0.6f, 1.0f)
+                    : ImVec4(0.85f, 0.85f, 0.95f, 1.0f)));
+                ImGui::TableSetColumnIndex(0); ImGui::TextColored(col, "%s", m.type.c_str());
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%.0f", m.frequency);
+                ImGui::TableSetColumnIndex(2);
+                if (m.has_ira) ImGui::Text("%03d", m.ira_sat);
+                else if (m.has_ibc) ImGui::Text("%03d", m.ibc_sat);
+                else ImGui::TextUnformatted("-");
+                ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(m.pretty.c_str());
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+}
+
+void draw_playback_window() {
+    ImGui::SetNextWindowSize(ImVec2(430, 0), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Playback")) {
+        bool running = g_engine.running();
+        if (!running) {
+            ImGui::BeginDisabled(!g_source.is_open());
+            if (ImGui::Button("Start")) { if (g_engine.start(&g_source)) { apply_spectrum_settings(); } }
+            ImGui::EndDisabled();
+        } else {
+            if (ImGui::Button(g_engine.paused() ? "Resume" : "Pause")) g_engine.set_paused(!g_engine.paused());
+            ImGui::SameLine();
+            if (ImGui::Button("Stop")) g_engine.stop();
+        }
+        ImGui::SameLine();
+        bool rt = g_engine.realtime();
+        if (ImGui::Checkbox("1x realtime", &rt)) g_engine.set_realtime(rt);
+
+        iridi::EngineStats s = g_engine.stats();
+        float frac = s.total_samples ? (float)((double)s.samples / (double)s.total_samples) : 0.0f;
+        char overlay[64];
+        snprintf(overlay, sizeof(overlay), "%.1f%% (%.1f s)", frac * 100.0f, s.elapsed_s);
+        ImGui::ProgressBar(frac, ImVec2(-1, 0), overlay);
+        if (s.done) ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "Done");
+    }
+    ImGui::End();
+}
+
+void draw_stats_window() {
+    if (!g_show_stats) return;
+    ImGui::SetNextWindowSize(ImVec2(360, 220), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Stats", &g_show_stats)) {
+        iridi::EngineStats s = g_engine.stats();
+        if (ImGui::BeginTable("stats", 2, ImGuiTableFlags_SizingStretchProp)) {
+            auto row = [](const char *k, const char *v) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(k);
+                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(v);
+            };
+            char b[64];
+            snprintf(b, sizeof(b), "%llu", (unsigned long long)s.bursts);      row("Bursts tagged", b);
+            snprintf(b, sizeof(b), "%llu", (unsigned long long)s.frames_ok);   row("Frames demod", b);
+            snprintf(b, sizeof(b), "%llu", (unsigned long long)s.frames_fail); row("Frames failed", b);
+            snprintf(b, sizeof(b), "%llu", (unsigned long long)g_engine.parsed_count()); row("Parsed frames", b);
+            snprintf(b, sizeof(b), "%llu", (unsigned long long)g_engine.parse_error_count()); row("Parse errors", b);
+            snprintf(b, sizeof(b), "%zu", g_engine.satellites().size());       row("Satellites", b);
+            snprintf(b, sizeof(b), "%.1f s", s.elapsed_s);                     row("Elapsed", b);
+            snprintf(b, sizeof(b), "%s", s.running ? (s.paused ? "paused" : "running") : "stopped");
+            row("State", b);
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+}
+
+void draw_spectrum_controls() {
+    ImGui::SetNextItemWidth(110);
+    if (ImGui::Combo("FFT", &g_fft_idx, kFftLabels, kNumFftSizes)) {
+        g_engine.set_fft_size(kFftSizes[g_fft_idx]);
+        g_freq_mhz.clear(); // axis depends on N
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110);
+    if (ImGui::SliderFloat("Avg", &g_avg_alpha, 0.0f, 0.98f, "%.2f"))
+        g_engine.set_avg_alpha(g_avg_alpha);
+    ImGui::SameLine();
+    ImGui::Checkbox("Auto", &g_autoscale);
+    ImGui::SameLine();
+    if (ImGui::Checkbox("DC block", &g_dc_block)) g_engine.set_dc_block(g_dc_block);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90);
+    ImGui::InputFloat("min", &g_db_min, 1.0f, 5.0f, "%.0f");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90);
+    ImGui::InputFloat("max", &g_db_max, 1.0f, 5.0f, "%.0f");
+    if (g_db_max < g_db_min + 5.0f) g_db_max = g_db_min + 5.0f;
+}
+
+void draw_spectrum_window() {
+    if (!g_show_spectrum) return;
+    ImGui::SetNextWindowSize(ImVec2(760, 280), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Spectrum", &g_show_spectrum)) {
+        draw_spectrum_controls();
+        std::vector<float> avg = g_engine.spectrum_avg();
+        int N = (int)avg.size();
+        if (N < 2) {
+            ImGui::TextDisabled("Waiting for data...");
+            ImGui::End();
+            return;
+        }
+        if ((int)g_freq_mhz.size() != N) {
+            g_freq_mhz.resize(N);
+            double fc = g_source.info().center_frequency;
+            double fs = g_source.info().sample_rate ? g_source.info().sample_rate : 1.0;
+            for (int i = 0; i < N; i++)
+                g_freq_mhz[i] = (float)((fc + ((double)i - N / 2) * fs / N) / 1e6);
+        }
+        if (ImPlot::BeginPlot("##spectrum", ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
+            ImPlot::SetupAxes("MHz", "dBm", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_None);
+            float x0 = g_freq_mhz.front(), x1 = g_freq_mhz.back();
+            ImPlot::SetupAxisLimits(ImAxis_X1, x0, x1, ImGuiCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, g_db_min, g_db_max, ImGuiCond_Always);
+            ImPlot::PlotLine("PSD", g_freq_mhz.data(), avg.data(), N);
+            ImPlot::EndPlot();
+        }
+    }
+    ImGui::End();
+}
+
+void draw_waterfall_window() {
+    if (!g_show_waterfall) return;
+    ImGui::SetNextWindowSize(ImVec2(760, 320), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Waterfall", &g_show_waterfall)) {
+        draw_spectrum_controls();
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        g_waterfall.draw(avail);
+    }
+    ImGui::End();
+}
+
+void draw_bursts_window() {
+    if (!g_show_bursts) return;
+    ImGui::SetNextWindowSize(ImVec2(620, 300), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Bursts", &g_show_bursts)) {
+        auto frames = g_engine.recent_frames(500);
+        ImGui::TextDisabled("%zu recent demodulated frames", frames.size());
+        if (ImGui::BeginTable("bursts", 5,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
+                ImVec2(0, 0))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Freq (Hz)");
+            ImGui::TableSetupColumn("Dir");
+            ImGui::TableSetupColumn("Conf");
+            ImGui::TableSetupColumn("Bits");
+            ImGui::TableSetupColumn("Timestamp (s)");
+            ImGui::TableHeadersRow();
+            for (auto it = frames.rbegin(); it != frames.rend(); ++it) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::Text("%.0f", it->frequency);
+                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(it->direction == 1 ? "DL" : "UL");
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%d%%", it->confidence);
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%d", it->n_bits);
+                ImGui::TableSetColumnIndex(4); ImGui::Text("%.6f", it->timestamp_ns / 1e9);
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+}
+
+void draw_acars_window() {
+    if (!g_show_acars) return;
+    ImGui::SetNextWindowSize(ImVec2(860, 260), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("ACARS", &g_show_acars)) {
+        auto msgs = g_engine.acars().messages();
+        const auto &as = g_engine.acars();
+        ImGui::TextDisabled("%zu ACARS messages   [IDA asm %llu, SBD pkts %llu]",
+                            msgs.size(), (unsigned long long)as.ida_assembled(),
+                            (unsigned long long)as.sbd_packets());
+        if (ImGui::BeginTable("acars", 7,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
+                ImVec2(0, 0))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 70);
+            ImGui::TableSetupColumn("Dir", ImGuiTableColumnFlags_WidthFixed, 30);
+            ImGui::TableSetupColumn("Reg", ImGuiTableColumnFlags_WidthFixed, 78);
+            ImGui::TableSetupColumn("Flight", ImGuiTableColumnFlags_WidthFixed, 66);
+            ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 96);
+            ImGui::TableSetupColumn("bID", ImGuiTableColumnFlags_WidthFixed, 28);
+            ImGui::TableSetupColumn("Text", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            for (auto it = msgs.rbegin(); it != msgs.rend(); ++it) {
+                const auto &m = *it;
+                ImGui::TableNextRow();
+                time_t t = (time_t)(m.timestamp_ns / 1000000000ULL);
+                struct tm tmv; localtime_s(&tmv, &t);
+                char tbuf[32];
+                snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(tbuf);
+                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(m.ul ? "UL" : "DL");
+                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(m.reg.c_str());
+                ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(m.flight.c_str());
+                ImGui::TableSetColumnIndex(4);
+                ImGui::Text("%s (%s)", m.label.c_str(), m.label_desc.c_str());
+                ImGui::TableSetColumnIndex(5); ImGui::TextUnformatted(m.bid.c_str());
+                ImGui::TableSetColumnIndex(6);
+                ImVec4 col = m.crc_ok ? ImVec4(0.6f, 1.0f, 0.6f, 1.0f) : ImVec4(0.9f, 0.8f, 0.5f, 1.0f);
+                ImGui::TextColored(col, "%s", m.text.c_str());
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+}
+
+void draw_voice_window() {
+    if (!g_show_voice) return;
+    ImGui::SetNextWindowSize(ImVec2(680, 320), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Voice", &g_show_voice)) {
+        auto calls = g_engine.voices().calls();
+        int active = 0; for (auto &c : calls) if (c.active) active++;
+        ImGui::TextDisabled("%zu voice calls (%d active)  [%s]", calls.size(), active,
+                            g_audio.playing() ? "playing" : "idle");
+        ImGui::SameLine();
+        if (ImGui::Button("Stop audio")) g_audio.stop();
+        if (ImGui::BeginTable("calls", 6,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
+                ImVec2(0, 140))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 46);
+            ImGui::TableSetupColumn("MHz", ImGuiTableColumnFlags_WidthFixed, 88);
+            ImGui::TableSetupColumn("Dur s", ImGuiTableColumnFlags_WidthFixed, 56);
+            ImGui::TableSetupColumn("Frames", ImGuiTableColumnFlags_WidthFixed, 56);
+            ImGui::TableSetupColumn("Err", ImGuiTableColumnFlags_WidthFixed, 50);
+            ImGui::TableSetupColumn("State");
+            ImGui::TableHeadersRow();
+            for (auto it = calls.rbegin(); it != calls.rend(); ++it) {
+                const auto &cv = *it;
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                char lbl[32]; snprintf(lbl, sizeof(lbl), "#%d", cv.id);
+                if (ImGui::Selectable(lbl, g_selected_voice == cv.id, ImGuiSelectableFlags_SpanAllColumns)) {
+                    g_selected_voice = cv.id; g_voice_cache_id = -1;
+                }
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%.4f", cv.channel_hz / 1e6);
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%.1f", cv.duration_s);
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%d", cv.frames);
+                ImGui::TableSetColumnIndex(4); ImGui::Text("%.2f", cv.error_ratio);
+                ImGui::TableSetColumnIndex(5);
+                ImGui::TextColored(cv.error_ratio < 0.5f ? ImVec4(0.5f, 1, 0.5f, 1)
+                                                         : ImVec4(0.9f, 0.7f, 0.4f, 1),
+                                   "%s", cv.active ? "active" : "done");
+            }
+            ImGui::EndTable();
+        }
+        if (g_selected_voice >= 0) {
+            if (g_voice_cache_id != g_selected_voice) {
+                g_voice_cache = g_engine.voices().pcm(g_selected_voice);
+                g_voice_cache_id = g_selected_voice;
+            }
+            if (!g_voice_cache.empty()) {
+                ImGui::Text("Call #%d  (%zu samples, %.1f s)", g_selected_voice,
+                            g_voice_cache.size(), g_voice_cache.size() / 8000.0);
+                if (ImGui::Button("Play")) g_audio.play(g_voice_cache, 8000);
+                ImGui::SameLine();
+                if (ImGui::Button("Stop")) g_audio.stop();
+                if (ImPlot::BeginPlot("##wave", ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
+                    const auto &pcm = g_voice_cache;
+                    int n = (int)pcm.size();
+                    int step = std::max(1, n / 4000);
+                    std::vector<float> xs, ys;
+                    xs.reserve(n / step + 1); ys.reserve(n / step + 1);
+                    for (int i = 0; i < n; i += step) {
+                        xs.push_back((float)i / 8000.0f);
+                        ys.push_back(pcm[i] / 32768.0f);
+                    }
+                    ImPlot::SetupAxes("s", "", 0, ImPlotAxisFlags_AutoFit);
+                    ImPlot::PlotLine("wave", xs.data(), ys.data(), (int)xs.size());
+                    ImPlot::EndPlot();
+                }
+            } else {
+                ImGui::TextDisabled("(no audio captured for this call yet)");
+            }
+        }
+    }
+    ImGui::End();
+}
+
+void draw_source_window() {
+    if (!g_show_source) return;
+    ImGui::SetNextWindowSize(ImVec2(520, 260), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Source", &g_show_source)) {
+        if (!g_source.is_open()) {
+            ImGui::TextDisabled("No IQ file loaded.");
+            if (ImGui::Button("Open IQ file...")) g_request_open = true;
+            ImGui::End();
+            return;
+        }
+        const auto &in = g_source.info();
+        ImGui::TextWrapped("%s", in.path.c_str());
+        ImGui::Separator();
+        if (ImGui::BeginTable("info", 2, ImGuiTableFlags_SizingStretchProp)) {
+            auto row = [](const char *k, const char *fmt, ...) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(k);
+                ImGui::TableSetColumnIndex(1);
+                char b[256]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof(b), fmt, ap); va_end(ap);
+                ImGui::TextUnformatted(b);
+            };
+            row("Format", "%s", iridi::iq_format_name(in.format));
+            row("Container", "%s", in.is_wav ? "WAV (RIFF)" : "raw");
+            row("Sample rate", "%d Hz", in.sample_rate);
+            row("Complex samples", "%llu", (unsigned long long)in.num_samples);
+            row("Duration", "%.3f s", in.duration_s);
+            if (in.center_frequency > 0) row("Center freq", "%.0f Hz", in.center_frequency);
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+}
+
+void build_default_dock_layout(ImGuiID dockspace_id) {
+    ImGui::DockBuilderRemoveNode(dockspace_id);
+    ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
+    ImGui::DockBuilderSetNodeSize(dockspace_id, ImGui::GetMainViewport()->Size);
+
+    ImGuiID center = dockspace_id;
+    ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.34f, nullptr, &center);
+    ImGuiID right  = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.34f, nullptr, &center);
+    ImGuiID left   = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.22f, nullptr, &center);
+
+    ImGui::DockBuilderDockWindow("Map", center);
+    ImGui::DockBuilderDockWindow("Spectrum", right);
+    ImGui::DockBuilderDockWindow("Bursts", right);
+    ImGui::DockBuilderDockWindow("Waterfall", bottom);
+    ImGui::DockBuilderDockWindow("Messages", bottom);
+    ImGui::DockBuilderDockWindow("Voice", bottom);
+    ImGui::DockBuilderDockWindow("ACARS", bottom);
+    ImGui::DockBuilderDockWindow("Playback", left);
+    ImGui::DockBuilderDockWindow("Stats", left);
+    ImGui::DockBuilderDockWindow("Satellites", left);
+    ImGui::DockBuilderDockWindow("Source", left);
+    ImGui::DockBuilderFinish(dockspace_id);
+}
+
+void apply_style() {
+    ImGui::StyleColorsDark();
+    ImGuiStyle &s = ImGui::GetStyle();
+    s.WindowRounding = 4.0f;
+    s.FrameRounding = 3.0f;
+    s.GrabRounding = 3.0f;
+    s.WindowBorderSize = 1.0f;
+    ImVec4 accent = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
+    s.Colors[ImGuiCol_Header] = ImVec4(accent.x, accent.y, accent.z, 0.35f);
+    s.Colors[ImGuiCol_Button] = ImVec4(accent.x, accent.y, accent.z, 0.45f);
+}
+
+} // namespace
+
+static int print_file_info(const char *path) {
+    iridi::IqFileSource src;
+    std::string err;
+    if (!src.open(path, err)) { fprintf(stderr, "%s\n", err.c_str()); return 2; }
+    const auto &in = src.info();
+    printf("path=%s\nformat=%s\ncontainer=%s\nsample_rate=%d\nchannels=%d\n",
+           in.path.c_str(), iridi::iq_format_name(in.format), in.is_wav ? "wav" : "raw",
+           in.sample_rate, in.channels);
+    printf("num_samples=%llu\nduration_s=%.6f\ncenter_frequency=%.0f\n",
+           (unsigned long long)in.num_samples, in.duration_s, in.center_frequency);
+    return 0;
+}
+
+static int scan_file(const char *path, double seconds) {
+    iridi::IqFileSource src;
+    std::string err;
+    if (!src.open(path, err)) { fprintf(stderr, "%s\n", err.c_str()); return 2; }
+    iridi::Engine eng;
+    if (!eng.start(&src)) { fprintf(stderr, "engine start failed\n"); return 3; }
+    auto t0 = std::chrono::steady_clock::now();
+    while (true) {
+        auto s = eng.stats();
+        if (s.done) break;
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > seconds) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    auto s = eng.stats();
+    printf("samples=%llu\nbursts=%llu\nframes_ok=%llu\nframes_fail=%llu\nelapsed_s=%.3f\ndone=%d\n",
+           (unsigned long long)s.samples, (unsigned long long)s.bursts,
+           (unsigned long long)s.frames_ok, (unsigned long long)s.frames_fail,
+           s.elapsed_s, s.done ? 1 : 0);
+    printf("parsed=%llu\nparse_errors=%llu\nsatellites=%zu\nmessages=%zu\n",
+           (unsigned long long)eng.parsed_count(),
+           (unsigned long long)eng.parse_error_count(),
+           eng.satellites().size(), eng.recent_messages(100000).size());
+    auto vc = eng.voices().calls();
+    int good = 0; size_t withpcm = 0;
+    for (auto &c : vc) { if (c.error_ratio < 0.5) good++; if (!eng.voices().pcm(c.id).empty()) withpcm++; }
+    printf("voice_calls=%zu voice_good=%d voice_with_audio=%zu\n", vc.size(), good, withpcm);
+    printf("acars_messages=%zu sbd_packets=%llu ida_assembled=%llu\n",
+           eng.acars().messages().size(),
+           (unsigned long long)eng.acars().sbd_packets(),
+           (unsigned long long)eng.acars().ida_assembled());
+    eng.stop();
+    return 0;
+}
+
+static int parse_raw_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); return 2; }
+    char line[16384];
+    std::map<std::string, long> counts;
+    long total = 0, err = 0, malformed = 0;
+    while (fgets(line, sizeof(line), f)) {
+        std::string s(line);
+        if (s.rfind("RAW:", 0) != 0) continue;
+        std::istringstream iss(s);
+        std::vector<std::string> t;
+        std::string tok;
+        while (iss >> tok) t.push_back(tok);
+        if (t.size() < 6) { malformed++; continue; }
+        double freq = atof(t[3].c_str());
+        int conf = 0;
+        for (auto &x : t) if (x.size() && x.back() == '%') conf = atoi(x.c_str());
+        std::string bits = t.back();
+        if (bits.empty() || bits.find_first_not_of("01") != std::string::npos) { malformed++; continue; }
+        irid::RawFrame rf;
+        rf.bitstream = bits;
+        rf.frequency = freq;
+        rf.confidence = conf;
+        rf.n_symbols = (int)bits.size() / 2;
+        irid::ParsedMessage pm;
+        irid::parse_frame(rf, pm);
+        counts[pm.type]++;
+        total++;
+        if (pm.error) err++;
+    }
+    fclose(f);
+    std::vector<std::pair<long, std::string>> v;
+    for (auto &kv : counts) v.push_back({kv.second, kv.first});
+    std::sort(v.rbegin(), v.rend());
+    printf("total=%ld errors=%ld malformed=%ld\n", total, err, malformed);
+    for (auto &kv : v) printf("  %-6s %ld\n", kv.second.c_str(), kv.first);
+    return 0;
+}
+
+namespace irid { extern int irid_debug; }
+
+static int parse_frames_debug(const char *path) {
+    irid::irid_debug = 1;
+    FILE *f = fopen(path, "r");
+    if (!f) return 2;
+    char line[16384];
+    while (fgets(line, sizeof(line), f)) {
+        std::string s(line);
+        if (s.rfind("RAW:", 0) != 0) continue;
+        std::istringstream iss(s);
+        std::vector<std::string> t; std::string tok;
+        while (iss >> tok) t.push_back(tok);
+        if (t.size() < 6) continue;
+        irid::RawFrame rf;
+        rf.frequency = atof(t[3].c_str());
+        rf.bitstream = t.back();
+        rf.n_symbols = (int)rf.bitstream.size() / 2;
+        irid::ParsedMessage pm;
+        bool ok = irid::parse_frame(rf, pm);
+        fprintf(stderr, "=> type=%s ok=%d err=%d\n", pm.type.c_str(), ok, pm.error);
+    }
+    fclose(f);
+    return 0;
+}
+
+// When built as a GUI subsystem app there is no console. For the headless
+// modes, attach to the invoking terminal so output is visible.
+static void attach_console() {
+#ifdef _WIN32
+    // If stdout is already connected (e.g. redirected to a pipe), keep it.
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h != NULL && h != INVALID_HANDLE_VALUE) return;
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        FILE *f;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+        freopen_s(&f, "CONOUT$", "w", stderr);
+        freopen_s(&f, "CONIN$", "r", stdin);
+    }
+#endif
+}
+
+int main(int argc, char **argv) {
+    if (argc >= 2) {
+        std::string a1 = argv[1];
+        if (a1 == "--info" || a1 == "--parse" || a1 == "--frame" || a1 == "--scan")
+            attach_console();
+    }
+    if (argc >= 3 && std::string(argv[1]) == "--info") return print_file_info(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == "--parse") return parse_raw_file(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == "--frame") return parse_frames_debug(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == "--scan") return scan_file(argv[2], argc >= 4 ? atof(argv[3]) : 12.0);
+
+    if (!glfwInit()) { fprintf(stderr, "Failed to initialize GLFW\n"); return 1; }
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    g_window = glfwCreateWindow(1600, 900, "IridiScope", nullptr, nullptr);
+    if (!g_window) { fprintf(stderr, "Failed to create GLFW window\n"); glfwTerminate(); return 1; }
+    glfwMakeContextCurrent(g_window);
+    glfwSwapInterval(1);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImPlot::CreateContext();
+    ImGuiIO &io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+
+    // Seed the window layout from the bundled default on first run, so the
+    // shipped docking arrangement is the default.
+    const char *ini_path = "iridiscope.ini";
+    bool force_default = false;
+    if (GetFileAttributesA(ini_path) == INVALID_FILE_ATTRIBUTES) {
+        std::string def = std::string(IRIDISCOPE_ASSETS) + "/default_layout.ini";
+        if (!CopyFileA(def.c_str(), ini_path, FALSE)) force_default = true;
+    }
+    io.IniFilename = ini_path;
+    bool dock_built = false;
+    apply_style();
+
+    ImGui_ImplGlfw_InitForOpenGL(g_window, true);
+    ImGui_ImplOpenGL3_Init("#version 150");
+
+    add_log("IridiScope - Iridium signal analysis workstation");
+    add_log("OpenGL: %s", glGetString(GL_VERSION) ? (const char *)glGetString(GL_VERSION) : "?");
+
+    std::string map_path = std::string(IRIDISCOPE_ASSETS) + "/worldmap.jpg";
+    g_map_tex = load_texture(map_path, g_map_w, g_map_h);
+
+    if (argc > 1) open_iq_file(argv[1]);
+
+    while (!glfwWindowShouldClose(g_window)) {
+        glfwPollEvents();
+        if (g_request_open) { g_request_open = false; open_iq_file(open_file_dialog()); }
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O)) g_request_open = true;
+
+        // Pull new spectrum into the waterfall and auto-range.
+        uint64_t seq = g_engine.spectrum_seq();
+        if (seq != g_spec_seq) {
+            g_spec_seq = seq;
+            std::vector<float> inst = g_engine.spectrum_inst();
+            int N = (int)inst.size();
+            if (N > 0) {
+                if (g_autoscale) {
+                    float floorDb = g_engine.spectrum_floor();
+                    float peakDb = g_engine.spectrum_peak();
+                    float tgtMin = floorDb - 6.0f;
+                    float tgtMax = std::max(peakDb + 12.0f, floorDb + 20.0f);
+                    g_db_min = 0.85f * g_db_min + 0.15f * tgtMin;
+                    g_db_max = 0.85f * g_db_max + 0.15f * tgtMax;
+                    if (g_db_max < g_db_min + 5.0f) g_db_max = g_db_min + 5.0f;
+                }
+                g_waterfall.addRow(inst.data(), N, g_db_min, g_db_max);
+            }
+        }
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        ImGuiID dock_id = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
+        if (force_default && !dock_built) { build_default_dock_layout(dock_id); dock_built = true; }
+
+        draw_menu_bar();
+        draw_map_window();
+        draw_playback_window();
+        draw_stats_window();
+        draw_spectrum_window();
+        draw_waterfall_window();
+        draw_bursts_window();
+        draw_messages_window();
+        draw_satellites_window();
+        draw_voice_window();
+        draw_acars_window();
+        draw_source_window();
+
+        ImGui::Render();
+        int fbw, fbh;
+        glfwGetFramebufferSize(g_window, &fbw, &fbh);
+        glViewport(0, 0, fbw, fbh);
+        glClearColor(0.08f, 0.09f, 0.11f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(g_window);
+    }
+
+    g_engine.stop();
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImPlot::DestroyContext();
+    ImGui::DestroyContext();
+    if (g_map_tex) glDeleteTextures(1, &g_map_tex);
+    glfwDestroyWindow(g_window);
+    glfwTerminate();
+    return 0;
+}

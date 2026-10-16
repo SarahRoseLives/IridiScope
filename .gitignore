@@ -1,0 +1,26 @@
+# Build output (anywhere, including vendored reference repos)
+build/
+build-*/
+
+# Large IQ sample recordings - never commit
+/IQ Samples/
+*.wav
+*.raw
+*.cf32
+*.ci16
+*.ci8
+/*.log
+
+# Runtime output
+/recordings/
+*.ini
+!assets/default_layout.ini
+*.user
+*.tmp
+
+# Vendored FFTW: source comes from the checked-in tarball, build is generated.
+/third_party/fftw/fftw-3.3.10/
+/third_party/fftw/install/
+
+# GLFW source is vendored extracted (third_party/glfw); its tarball is redundant.
+/third_party/glfw-3.4.tar.gz

@@ -1,0 +1,56 @@
+# GSM:
+# 03: Call Control - OK
+# 03.01 CC: Alerting
+# 03.02 CC: Call Proceeding
+# 03.05 CC: Setup (Number)
+# 03.07 CC: Connect
+# 03.0f CC: Connect Acknowledge
+# 03.25 CC: Disconnect
+# 03.2a CC: Release Complete
+# 03.2d CC: Release
+#
+# 05: Mobility Management - OK
+# 05.02 MM: Location Updating Accept (LAI)
+# 05.04 MM: Location Updating Reject
+# > 05.08 MM: Location Updating Request
+# 05.12 MM: Authentication Request (RAND)
+# > 05.14 MM: Authentication Response
+# 05.18 MM: Identity request
+# > 05.19 MM: Identity response (IMEI)
+# 05.1a MM: TMSI Reallocation Command (LAC, TIMSI)
+# > 05.1b MM: TMSI Reallocation Complete
+# 05.21 MM: CM Service Accept
+# 05.22 MM: CM Service Reject
+# > 05.24 MM: CM Service Request
+#
+# 09: SMS Messages - OK
+# 09.01 SMS CP-DATA (Number, SMS)
+# 09.04 SMS CP-ACK
+# 09.10 SMS CP-ERROR
+#
+# 0b: Non call related SS messages
+# 0b.2a Release Complete
+# 0b.3b Register
+
+# non-GSM:
+# 06: (Radio Resource Management)
+# > 06.00 Access Request Message
+# 06.05 Access decision
+# 06.07 <empty>
+# > 06.35
+# 06.3a <empty>
+# 06.3b
+#
+# 76: SBD
+# 76.05 Access decision
+# 76.08 SBD DL1
+# 76.09 SBD DL2
+# 76.0a SBD DL3+
+# > 76.0c SBD UL1
+# > 76.0d SBD UL2
+# > 76.0e SBD UL3+
+#
+# 08: ?
+# 08.05 ?
+# 08.39 ?
+# 08.3a <empty>

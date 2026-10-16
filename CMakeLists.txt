@@ -1,6 +1,18 @@
 cmake_minimum_required(VERSION 3.16)
 project(IridiScope C CXX)
 
+# Embed the application icon (icon.ico in the project root). Windows uses the
+# "1" resource for the exe/taskbar; GLFW loads the named "GLFW_ICON" resource
+# for the window/titlebar.
+set(IRIDISCOPE_RC "")
+if(EXISTS "${CMAKE_SOURCE_DIR}/icon.ico")
+  enable_language(RC)
+  set(IRIDISCOPE_ICON "${CMAKE_SOURCE_DIR}/icon.ico")
+  configure_file("${CMAKE_SOURCE_DIR}/app.rc.in" "${CMAKE_BINARY_DIR}/app.rc" @ONLY)
+  set(IRIDISCOPE_RC "${CMAKE_BINARY_DIR}/app.rc")
+  message(STATUS "Embedding application icon: ${IRIDISCOPE_ICON}")
+endif()
+
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -179,7 +191,7 @@ set(APP_SOURCES
 )
 
 # WIN32 => Windows GUI subsystem: no console window on launch.
-add_executable(IridiScope WIN32 ${APP_SOURCES} ${IMGUI_SOURCES} ${CORE_SOURCES})
+add_executable(IridiScope WIN32 ${APP_SOURCES} ${IMGUI_SOURCES} ${CORE_SOURCES} ${IRIDISCOPE_RC})
 
 target_include_directories(IridiScope PRIVATE
   src

@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <ctime>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -35,6 +36,7 @@
 
 #include "core/file_source.h"
 #include "core/engine.h"
+#include "acars/aircraft_lookup.h"
 #include "sdr/live_iq_source.h"
 #include "ui/waterfall.h"
 #include "update/version_check.h"
@@ -72,6 +74,18 @@ iridi::AudioPlayer g_audio;
 // Update check.
 iridi::VersionCheck g_version_check;
 const char *kUpdateUrl = "https://sarahsforge.dev/api/version.php?slug=iridiscope";
+
+// Aircraft info lookups (adsbdb).
+iridi::AircraftLookup g_lookup;
+bool g_lookup_enabled = true;
+std::string g_lookup_reg;
+std::string g_lookup_flight;
+bool g_show_aircraft_info = false;
+
+// Voice auto-play: newly completed calls are queued and played in order.
+bool g_autoplay = false;
+int g_autoplay_last_id = -1;
+std::deque<int> g_autoplay_queue;
 
 // Active input: 0 = IQ file, 1 = SDRplay, 2 = HackRF, 3 = Airspy.
 int g_source_kind = 0;
@@ -232,6 +246,8 @@ void apply_spectrum_settings() {
 void start_engine() {
     iridi::IqSource *src = active_source();
     if (!src->is_open()) { add_log("ERROR: no source open"); return; }
+    g_autoplay_last_id = -1;
+    g_autoplay_queue.clear();
     if (g_engine.start(src)) { apply_spectrum_settings(); add_log("Engine started"); }
     else add_log("ERROR: failed to start engine");
 }
@@ -659,23 +675,91 @@ void draw_bursts_window() {
     ImGui::End();
 }
 
+void draw_aircraft_info_window() {
+    if (!g_show_aircraft_info) return;
+    ImGui::SetNextWindowSize(ImVec2(460, 0), ImGuiCond_Appearing);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
+                            ImVec2(0.5f, 0.5f));
+    if (!ImGui::Begin("Aircraft Info", &g_show_aircraft_info, ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End();
+        return;
+    }
+
+    iridi::AircraftInfo inf = g_lookup.get_aircraft(g_lookup_reg);
+    ImGui::Text("Registration: %s", g_lookup_reg.c_str());
+    ImGui::Separator();
+
+    if (!g_lookup_enabled) {
+        ImGui::TextDisabled("Aircraft lookups are disabled.");
+    } else {
+        switch (inf.status) {
+        case iridi::AircraftInfo::Pending:
+        case iridi::AircraftInfo::None:
+            ImGui::TextDisabled("Looking up %s ...", g_lookup_reg.c_str());
+            break;
+        case iridi::AircraftInfo::Ok: {
+            auto row = [](const char *k, const std::string &v) {
+                if (!v.empty()) ImGui::Text("%s: %s", k, v.c_str());
+            };
+            row("Operator", inf.owner);
+            row("Aircraft", inf.type);
+            row("ICAO type", inf.icao_type);
+            row("Manufacturer", inf.manufacturer);
+            row("Mode-S", inf.mode_s);
+            row("Country", inf.country);
+            row("Operator code", inf.operator_code);
+            if (!inf.photo_url.empty()) {
+                if (ImGui::Button("View photo")) open_url(inf.photo_url.c_str());
+            }
+            break;
+        }
+        case iridi::AircraftInfo::NotFound:
+            ImGui::TextDisabled("No information found for this registration.");
+            break;
+        default:
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "Lookup failed: %s",
+                               inf.error.c_str());
+            if (ImGui::Button("Retry")) g_lookup.request_aircraft(g_lookup_reg, true);
+            break;
+        }
+    }
+
+    if (!g_lookup_flight.empty()) {
+        iridi::AircraftInfo rt = g_lookup.get_route(g_lookup_flight);
+        if (rt.status == iridi::AircraftInfo::Ok) {
+            ImGui::Separator();
+            ImGui::Text("Flight: %s", g_lookup_flight.c_str());
+            if (!rt.airline.empty()) ImGui::Text("Airline: %s", rt.airline.c_str());
+            if (!rt.origin.empty() || !rt.destination.empty())
+                ImGui::Text("Route: %s -> %s", rt.origin.c_str(), rt.destination.c_str());
+        }
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button("Close")) g_show_aircraft_info = false;
+    ImGui::End();
+}
+
 void draw_acars_window() {
     if (!g_show_acars) return;
-    ImGui::SetNextWindowSize(ImVec2(860, 260), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(980, 300), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("ACARS", &g_show_acars)) {
         auto msgs = g_engine.acars().messages();
         const auto &as = g_engine.acars();
         ImGui::TextDisabled("%zu ACARS messages   [IDA asm %llu, SBD pkts %llu]",
                             msgs.size(), (unsigned long long)as.ida_assembled(),
                             (unsigned long long)as.sbd_packets());
-        if (ImGui::BeginTable("acars", 7,
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Look up aircraft info", &g_lookup_enabled))
+            g_lookup.set_enabled(g_lookup_enabled);
+
+        if (ImGui::BeginTable("acars", 6,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
                 ImVec2(0, 0))) {
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 70);
             ImGui::TableSetupColumn("Dir", ImGuiTableColumnFlags_WidthFixed, 30);
-            ImGui::TableSetupColumn("Reg", ImGuiTableColumnFlags_WidthFixed, 78);
-            ImGui::TableSetupColumn("Flight", ImGuiTableColumnFlags_WidthFixed, 66);
+            ImGui::TableSetupColumn("Reg", ImGuiTableColumnFlags_WidthFixed, 84);
             ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 96);
             ImGui::TableSetupColumn("bID", ImGuiTableColumnFlags_WidthFixed, 28);
             ImGui::TableSetupColumn("Text", ImGuiTableColumnFlags_WidthStretch);
@@ -683,25 +767,75 @@ void draw_acars_window() {
             for (auto it = msgs.rbegin(); it != msgs.rend(); ++it) {
                 const auto &m = *it;
                 ImGui::TableNextRow();
+                char rowid[96];
+                snprintf(rowid, sizeof(rowid), "%llu|%s|%s|%s",
+                         (unsigned long long)m.timestamp_ns, m.reg.c_str(), m.bid.c_str(),
+                         m.label.c_str());
+                ImGui::PushID(rowid);
                 time_t t = (time_t)(m.timestamp_ns / 1000000000ULL);
                 struct tm tmv; localtime_s(&tmv, &t);
                 char tbuf[32];
                 snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
                 ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(tbuf);
                 ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(m.ul ? "UL" : "DL");
-                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(m.reg.c_str());
-                ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(m.flight.c_str());
-                ImGui::TableSetColumnIndex(4);
+                ImGui::TableSetColumnIndex(2);
+                if (m.reg.empty()) {
+                    ImGui::TextUnformatted("-");
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.8f, 1.0f, 1.0f));
+                    bool clicked = ImGui::Selectable(m.reg.c_str());
+                    ImGui::PopStyleColor();
+                    if (clicked) {
+                        g_lookup_reg = m.reg;
+                        g_lookup_flight = m.flight;
+                        if (g_lookup_enabled) {
+                            g_lookup.request_aircraft(m.reg);
+                            if (!m.flight.empty()) g_lookup.request_route(m.flight);
+                        }
+                        g_show_aircraft_info = true;
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click for aircraft info");
+                }
+                ImGui::TableSetColumnIndex(3);
                 ImGui::Text("%s (%s)", m.label.c_str(), m.label_desc.c_str());
-                ImGui::TableSetColumnIndex(5); ImGui::TextUnformatted(m.bid.c_str());
-                ImGui::TableSetColumnIndex(6);
-                ImVec4 col = m.crc_ok ? ImVec4(0.6f, 1.0f, 0.6f, 1.0f) : ImVec4(0.9f, 0.8f, 0.5f, 1.0f);
-                ImGui::TextColored(col, "%s", m.text.c_str());
+                ImGui::TableSetColumnIndex(4); ImGui::TextUnformatted(m.bid.c_str());
+                ImGui::TableSetColumnIndex(5);
+                ImVec4 col = m.crc_ok ? ImVec4(0.6f, 1.0f, 0.6f, 1.0f)
+                                      : ImVec4(0.9f, 0.8f, 0.5f, 1.0f);
+                float wrap_x = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+                ImGui::PushTextWrapPos(wrap_x);
+                ImGui::PushStyleColor(ImGuiCol_Text, col);
+                ImGui::TextWrapped("%s", m.text.c_str());
+                ImGui::PopStyleColor();
+                ImGui::PopTextWrapPos();
+                ImGui::PopID();
             }
             ImGui::EndTable();
         }
     }
     ImGui::End();
+}
+
+void update_autoplay() {
+    auto calls = g_engine.voices().calls();
+    for (const auto &c : calls) {
+        if (c.active || c.id <= g_autoplay_last_id) continue;
+        g_autoplay_last_id = c.id;
+        if (g_autoplay) g_autoplay_queue.push_back(c.id);
+    }
+    if (!g_autoplay) {
+        g_autoplay_queue.clear();
+        return;
+    }
+    if (!g_audio.playing() && !g_autoplay_queue.empty()) {
+        int id = g_autoplay_queue.front();
+        g_autoplay_queue.pop_front();
+        auto pcm = g_engine.voices().pcm(id);
+        if (!pcm.empty()) {
+            g_audio.play(pcm, 8000);
+            add_log("Auto play: voice call #%d (%.1f s)", id, pcm.size() / 8000.0);
+        }
+    }
 }
 
 void draw_voice_window() {
@@ -714,6 +848,10 @@ void draw_voice_window() {
                             g_audio.playing() ? "playing" : "idle");
         ImGui::SameLine();
         if (ImGui::Button("Stop audio")) g_audio.stop();
+        ImGui::SameLine();
+        ImGui::Checkbox("Auto play", &g_autoplay);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Automatically play new voice calls as they complete");
         if (ImGui::BeginTable("calls", 6,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
                 ImVec2(0, 140))) {
@@ -872,8 +1010,9 @@ void draw_sdr_source_controls() {
         ImGui::EndDisabled();
     } else {
         if (ImGui::Button("Stop SDRplay")) {
-            g_engine.stop();
-            g_sdr.close();
+    g_engine.stop();
+    g_lookup.stop();
+    g_sdr.close();
             add_log("SDRplay stopped");
         }
         ImGui::SameLine();
@@ -1333,6 +1472,40 @@ static int check_update() {
     return 0;
 }
 
+static int lookup_registration(const char *reg) {
+    iridi::AircraftLookup lk;
+    lk.start();
+    lk.request_aircraft(reg);
+    iridi::AircraftInfo inf;
+    for (int i = 0; i < 150; ++i) {
+        inf = lk.get_aircraft(reg);
+        if (inf.status != iridi::AircraftInfo::None &&
+            inf.status != iridi::AircraftInfo::Pending)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    switch (inf.status) {
+    case iridi::AircraftInfo::Ok:
+        printf("registration=%s\noperator=%s\ntype=%s\nicao_type=%s\nmanufacturer=%s\n"
+               "mode_s=%s\ncountry=%s\nphoto=%s\n",
+               inf.registration.c_str(), inf.owner.c_str(), inf.type.c_str(),
+               inf.icao_type.c_str(), inf.manufacturer.c_str(), inf.mode_s.c_str(),
+               inf.country.c_str(), inf.photo_url.c_str());
+        break;
+    case iridi::AircraftInfo::NotFound:
+        printf("not_found=1\n");
+        break;
+    case iridi::AircraftInfo::Error:
+        printf("error=%s\n", inf.error.c_str());
+        break;
+    default:
+        printf("timeout=1\n");
+        break;
+    }
+    lk.stop();
+    return 0;
+}
+
 static int scan_live(iridi::SdrKind kind, double seconds, double rate_hz) {
     iridi::LiveIqSource sdr(kind);
     const char *label = (kind == iridi::SdrKind::HackRF) ? "HackRF" : "SDRplay";
@@ -1413,10 +1586,11 @@ int main(int argc, char **argv) {
         std::string a1 = argv[1];
         if (a1 == "--info" || a1 == "--parse" || a1 == "--frame" || a1 == "--scan" ||
             a1 == "--sdr-list" || a1 == "--sdr-scan" || a1 == "--hrf-list" || a1 == "--hrf-scan" ||
-            a1 == "--ap-list" || a1 == "--ap-scan" || a1 == "--check-update")
+            a1 == "--ap-list" || a1 == "--ap-scan" || a1 == "--check-update" || a1 == "--lookup")
             attach_console();
     }
     if (argc >= 2 && std::string(argv[1]) == "--check-update") return check_update();
+    if (argc >= 3 && std::string(argv[1]) == "--lookup") return lookup_registration(argv[2]);
     if (argc >= 2 && std::string(argv[1]) == "--sdr-list") return sdr_list_devices();
     if (argc >= 2 && std::string(argv[1]) == "--hrf-list") return hrf_list_devices();
     if (argc >= 2 && std::string(argv[1]) == "--ap-list") return ap_list_devices();
@@ -1473,8 +1647,11 @@ int main(int argc, char **argv) {
     g_map_tex = load_texture(map_path, g_map_w, g_map_h);
 
     g_version_check.start(kUpdateUrl, IRIDISCOPE_VERSION_STRING);
+    g_lookup.start();
 
-    if (argc > 1) open_iq_file(argv[1]);
+    int file_idx = 1;
+    if (argc > 1 && std::string(argv[1]) == "--autoplay") { g_autoplay = true; file_idx = 2; }
+    if (argc > file_idx) open_iq_file(argv[file_idx]);
 
     while (!glfwWindowShouldClose(g_window)) {
         glfwPollEvents();
@@ -1512,6 +1689,8 @@ int main(int argc, char **argv) {
             }
         }
 
+        update_autoplay();
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -1530,6 +1709,7 @@ int main(int argc, char **argv) {
         draw_satellites_window();
         draw_voice_window();
         draw_acars_window();
+        draw_aircraft_info_window();
         draw_source_window();
         draw_about_window();
 

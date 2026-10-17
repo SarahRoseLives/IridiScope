@@ -29,6 +29,11 @@ static std::string printable(const std::string &in) {
     for (unsigned char c : in) o += (c >= 32 && c < 127) ? (char)c : '.';
     return o;
 }
+static std::string trim_right(const std::string &s) {
+    size_t b = s.size();
+    while (b > 0 && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\0')) --b;
+    return s.substr(0, b);
+}
 static std::string label_desc(const std::string &label) {
     if (label.size() == 2 && label[0] == '_' && (unsigned char)label[1] == 0x7f)
         return "Demand mode";
@@ -129,7 +134,8 @@ void AcarsAssembler::decode_acars(const std::vector<uint8_t> &in, double time_s,
     m.raw_hex = hex(in);
     m.label_desc = label_desc(m.label);
     m.text = printable(m.text);
-    m.reg = printable(m.reg);
+    m.reg = trim_right(printable(m.reg));
+    m.flight = trim_right(m.flight);
 
     acars_cnt_++;
     msgs_.push_back(m);

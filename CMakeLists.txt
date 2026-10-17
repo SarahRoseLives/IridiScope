@@ -179,6 +179,7 @@ set(APP_SOURCES
   src/core/file_source.cpp
   src/core/engine.cpp
   src/sdr/live_iq_source.cpp
+  src/acars/aircraft_lookup.cpp
   src/update/version_check.cpp
   src/parser/fec.cpp
   src/parser/iridium_parser.cpp

@@ -15,6 +15,7 @@
 #include "core/file_source.h"
 #include "iridium/pipeline_c.h"
 #include "messages/acars.h"
+#include "messages/pager.h"
 #include "parser/iridium_parser.h"
 #include "voice/voice_manager.h"
 
@@ -67,6 +68,9 @@ public:
     void set_realtime(bool r) { realtime_.store(r); }
     bool realtime() const { return realtime_.load(); }
 
+    // Diagnostics: print iridium-toolkit RAW lines for each demodulated frame.
+    void set_raw_dump(bool on) { raw_dump_.store(on); }
+
     EngineStats stats() const;
 
     // Spectra (magnitude dB, fftshifted). Empty until the first block.
@@ -93,6 +97,7 @@ public:
 
     const VoiceManager &voices() const { return voice_; }
     const AcarsAssembler &acars() const { return acars_; }
+    const PagerAssembler &pager() const { return pager_; }
 
     // Callback target (public so a C trampoline can invoke it).
     void on_frame(const ir_frame_info_t *info);
@@ -108,6 +113,8 @@ private:
     std::atomic<bool> paused_{false};
     std::atomic<bool> realtime_{false};
     std::atomic<bool> done_{false};
+    std::atomic<bool> raw_dump_{false};
+    std::atomic<uint64_t> raw_base_ns_{0};
 
     std::atomic<uint64_t> samples_{0};
     std::atomic<uint64_t> total_samples_{0};
@@ -122,6 +129,7 @@ private:
 
     VoiceManager voice_;
     AcarsAssembler acars_;
+    PagerAssembler pager_;
 
     mutable std::mutex mtx_;
     std::vector<float> spectrum_inst_;

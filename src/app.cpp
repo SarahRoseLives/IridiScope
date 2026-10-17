@@ -162,6 +162,9 @@ bool g_show_messages = true;
 bool g_show_sats = true;
 bool g_show_voice = true;
 bool g_show_acars = true;
+bool g_show_pager = true;
+bool g_show_sms = true;
+bool g_show_sbd = true;
 bool g_show_about = false;
 int g_selected_voice = -1;
 int g_voice_cache_id = -1;
@@ -378,6 +381,9 @@ void draw_menu_bar() {
             ImGui::MenuItem("Satellites", nullptr, &g_show_sats);
             ImGui::MenuItem("Voice", nullptr, &g_show_voice);
             ImGui::MenuItem("ACARS", nullptr, &g_show_acars);
+            ImGui::MenuItem("Pager", nullptr, &g_show_pager);
+            ImGui::MenuItem("SMS", nullptr, &g_show_sms);
+            ImGui::MenuItem("SBD", nullptr, &g_show_sbd);
             ImGui::MenuItem("Source", nullptr, &g_show_source);
             ImGui::EndMenu();
         }
@@ -809,6 +815,131 @@ void draw_acars_window() {
                 ImGui::PopStyleColor();
                 ImGui::PopTextWrapPos();
                 ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+}
+
+static void pager_time(uint64_t ts_ns) {
+    time_t t = (time_t)(ts_ns / 1000000000ULL);
+    struct tm tmv; localtime_s(&tmv, &t);
+    ImGui::Text("%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+}
+
+static void pager_text_cell(const std::string &text, ImVec4 col) {
+    float wrap_x = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+    ImGui::PushTextWrapPos(wrap_x);
+    ImGui::PushStyleColor(ImGuiCol_Text, col);
+    ImGui::TextWrapped("%s", text.c_str());
+    ImGui::PopStyleColor();
+    ImGui::PopTextWrapPos();
+}
+
+void draw_pager_window() {
+    if (!g_show_pager) return;
+    ImGui::SetNextWindowSize(ImVec2(760, 300), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Pager", &g_show_pager)) {
+        auto pager = g_engine.pager().messages();
+        ImGui::TextDisabled("%zu pager messages", pager.size());
+        if (ImGui::BeginTable("pager", 5,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
+                ImVec2(0, 0))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 70);
+            ImGui::TableSetupColumn("RIC", ImGuiTableColumnFlags_WidthFixed, 80);
+            ImGui::TableSetupColumn("Seq", ImGuiTableColumnFlags_WidthFixed, 40);
+            ImGui::TableSetupColumn("Parts", ImGuiTableColumnFlags_WidthFixed, 44);
+            ImGui::TableSetupColumn("Text", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            for (auto it = pager.rbegin(); it != pager.rend(); ++it) {
+                const auto &m = *it;
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); pager_time(m.timestamp_ns);
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%07d", m.ric);
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%02d", m.seq);
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%d", m.parts > 0 ? m.parts : 1);
+                ImGui::TableSetColumnIndex(4);
+                pager_text_cell(m.text, m.ok ? ImVec4(0.6f, 1, 0.6f, 1)
+                                             : ImVec4(0.9f, 0.8f, 0.5f, 1));
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+}
+
+void draw_sms_window() {
+    if (!g_show_sms) return;
+    ImGui::SetNextWindowSize(ImVec2(760, 300), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("SMS", &g_show_sms)) {
+        auto sms = g_engine.acars().sms_messages();
+        ImGui::TextDisabled("%zu SMS messages", sms.size());
+        if (ImGui::BeginTable("sms", 4,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
+                ImVec2(0, 0))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 70);
+            ImGui::TableSetupColumn("Dir", ImGuiTableColumnFlags_WidthFixed, 30);
+            ImGui::TableSetupColumn("From / To", ImGuiTableColumnFlags_WidthFixed, 120);
+            ImGui::TableSetupColumn("Text", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            for (auto it = sms.rbegin(); it != sms.rend(); ++it) {
+                const auto &m = *it;
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); pager_time(m.timestamp_ns);
+                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(m.ul ? "UL" : "DL");
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted((m.ul ? m.to : m.from).c_str());
+                ImGui::TableSetColumnIndex(3);
+                pager_text_cell(m.text, m.ok ? ImVec4(0.6f, 1, 0.6f, 1)
+                                             : ImVec4(0.9f, 0.8f, 0.5f, 1));
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+}
+
+void draw_sbd_window() {
+    if (!g_show_sbd) return;
+    ImGui::SetNextWindowSize(ImVec2(900, 320), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("SBD", &g_show_sbd)) {
+        auto msgs = g_engine.acars().sbd_messages();
+        static bool hide_acars = true;
+        ImGui::TextDisabled("%zu SBD messages", msgs.size());
+        ImGui::SameLine();
+        ImGui::Checkbox("Hide ACARS", &hide_acars);
+        if (ImGui::BeginTable("sbd", 6,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
+                ImVec2(0, 0))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 70);
+            ImGui::TableSetupColumn("Dir", ImGuiTableColumnFlags_WidthFixed, 30);
+            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 64);
+            ImGui::TableSetupColumn("Len", ImGuiTableColumnFlags_WidthFixed, 40);
+            ImGui::TableSetupColumn("Preheader", ImGuiTableColumnFlags_WidthFixed, 160);
+            ImGui::TableSetupColumn("Payload (ASCII)", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            for (auto it = msgs.rbegin(); it != msgs.rend(); ++it) {
+                const auto &m = *it;
+                if (hide_acars && m.acars) continue;
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); pager_time(m.timestamp_ns);
+                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(m.ul ? "UL" : "DL");
+                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(m.type.c_str());
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%d", m.length);
+                ImGui::TableSetColumnIndex(4);
+                ImGui::TextUnformatted(m.preheader_hex.c_str());
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m.preheader_hex.c_str());
+                ImGui::TableSetColumnIndex(5);
+                pager_text_cell(m.text, ImVec4(0.7f, 0.85f, 1.0f, 1.0f));
+                if (ImGui::IsItemHovered()) {
+                    std::string hx = m.payload_hex;
+                    if (hx.size() > 900) hx = hx.substr(0, 900) + "...";
+                    ImGui::SetTooltip("%s", hx.c_str());
+                }
             }
             ImGui::EndTable();
         }
@@ -1295,6 +1426,8 @@ void draw_about_window() {
         ImGui::TextWrapped("SDR integration was modelled on AirScope by Sarah Rose.");
         ImGui::TextWrapped("Equirectangular map imagery courtesy of NASA.");
         ImGui::Spacing();
+        ImGui::TextWrapped("Thanks to Jomjom for providing the IQ samples used to develop IridiScope.");
+        ImGui::Spacing();
         ImGui::TextDisabled("Licensed under the GNU General Public License v3.");
     }
     ImGui::End();
@@ -1317,6 +1450,9 @@ void build_default_dock_layout(ImGuiID dockspace_id) {
     ImGui::DockBuilderDockWindow("Messages", bottom);
     ImGui::DockBuilderDockWindow("Voice", bottom);
     ImGui::DockBuilderDockWindow("ACARS", bottom);
+    ImGui::DockBuilderDockWindow("Pager", bottom);
+    ImGui::DockBuilderDockWindow("SMS", bottom);
+    ImGui::DockBuilderDockWindow("SBD", bottom);
     ImGui::DockBuilderDockWindow("Playback", left);
     ImGui::DockBuilderDockWindow("Stats", left);
     ImGui::DockBuilderDockWindow("Satellites", left);
@@ -1351,6 +1487,43 @@ static int print_file_info(const char *path) {
     return 0;
 }
 
+static int scan_raw(const char *path, double seconds, double start_s) {
+    iridi::IqFileSource src;
+    std::string err;
+    if (!src.open(path, err)) { fprintf(stderr, "%s\n", err.c_str()); return 2; }
+    if (start_s > 0.0 && src.info().sample_rate > 0) {
+        uint64_t idx = (uint64_t)(start_s * (double)src.info().sample_rate);
+        src.seek_sample(idx);
+    }
+    iridi::Engine eng;
+    eng.set_raw_dump(true);
+    if (!eng.start(&src)) { fprintf(stderr, "engine start failed\n"); return 3; }
+    auto t0 = std::chrono::steady_clock::now();
+    while (true) {
+        auto s = eng.stats();
+        if (s.done) break;
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > seconds)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    eng.stop();
+    return 0;
+}
+
+static void print_type_tally(iridi::Engine &eng) {
+    auto msgs = eng.recent_messages(4000);
+    std::map<std::string, int> tally;
+    size_t ims = 0, mframes = 0;
+    for (const auto &m : msgs) {
+        tally[m.type]++;
+        if (m.has_ims) ims++;
+        if (m.has_msg) mframes++;
+    }
+    printf("recent_types:");
+    for (const auto &kv : tally) printf(" %s=%d", kv.first.c_str(), kv.second);
+    printf("\nims=%zu msg_frames=%zu\n", ims, mframes);
+}
+
 static int scan_file(const char *path, double seconds) {
     iridi::IqFileSource src;
     std::string err;
@@ -1381,6 +1554,10 @@ static int scan_file(const char *path, double seconds) {
            eng.acars().messages().size(),
            (unsigned long long)eng.acars().sbd_packets(),
            (unsigned long long)eng.acars().ida_assembled());
+    printf("pager_messages=%zu sms_messages=%zu\n",
+           eng.pager().messages().size(), eng.acars().sms_messages().size());
+    printf("sbd_messages=%llu\n", (unsigned long long)eng.acars().sbd_message_count());
+    print_type_tally(eng);
     eng.stop();
     return 0;
 }
@@ -1506,6 +1683,26 @@ static int lookup_registration(const char *reg) {
     return 0;
 }
 
+static int sms_decode_hex(const char *hex) {
+    std::vector<uint8_t> b;
+    auto hv = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; hex[i] && hex[i + 1]; i += 2) {
+        int hi = hv(hex[i]), lo = hv(hex[i + 1]);
+        if (hi < 0 || lo < 0) break;
+        b.push_back((uint8_t)((hi << 4) | lo));
+    }
+    iridi::SmsMessage m;
+    bool ok = iridi::decode_sms_tpdu(b, m);
+    printf("ok=%d\nfrom=%s\nto=%s\ntext=%s\ndcs=%s\n", ok ? 1 : 0, m.from.c_str(),
+           m.to.c_str(), m.text.c_str(), m.dcs.c_str());
+    return 0;
+}
+
 static int scan_live(iridi::SdrKind kind, double seconds, double rate_hz) {
     iridi::LiveIqSource sdr(kind);
     const char *label = (kind == iridi::SdrKind::HackRF) ? "HackRF" : "SDRplay";
@@ -1536,6 +1733,9 @@ static int scan_live(iridi::SdrKind kind, double seconds, double rate_hz) {
            eng.acars().messages().size(),
            (unsigned long long)eng.acars().sbd_packets(),
            (unsigned long long)eng.acars().ida_assembled());
+    printf("pager_messages=%zu sms_messages=%zu\n",
+           eng.pager().messages().size(), eng.acars().sms_messages().size());
+    printf("sbd_messages=%llu\n", (unsigned long long)eng.acars().sbd_message_count());
     eng.stop();
     sdr.close();
     return 0;
@@ -1582,15 +1782,21 @@ static void attach_console() {
 }
 
 int main(int argc, char **argv) {
+    if (getenv("IRIDI_DEBUG")) irid::irid_debug = 1;
     if (argc >= 2) {
         std::string a1 = argv[1];
         if (a1 == "--info" || a1 == "--parse" || a1 == "--frame" || a1 == "--scan" ||
             a1 == "--sdr-list" || a1 == "--sdr-scan" || a1 == "--hrf-list" || a1 == "--hrf-scan" ||
-            a1 == "--ap-list" || a1 == "--ap-scan" || a1 == "--check-update" || a1 == "--lookup")
+            a1 == "--ap-list" || a1 == "--ap-scan" || a1 == "--check-update" ||
+            a1 == "--lookup" || a1 == "--sms" || a1 == "--raw")
             attach_console();
     }
     if (argc >= 2 && std::string(argv[1]) == "--check-update") return check_update();
     if (argc >= 3 && std::string(argv[1]) == "--lookup") return lookup_registration(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == "--sms") return sms_decode_hex(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == "--raw")
+        return scan_raw(argv[2], argc >= 4 ? atof(argv[3]) : 60.0,
+                        argc >= 5 ? atof(argv[4]) : 0.0);
     if (argc >= 2 && std::string(argv[1]) == "--sdr-list") return sdr_list_devices();
     if (argc >= 2 && std::string(argv[1]) == "--hrf-list") return hrf_list_devices();
     if (argc >= 2 && std::string(argv[1]) == "--ap-list") return ap_list_devices();
@@ -1698,6 +1904,30 @@ int main(int argc, char **argv) {
         ImGuiID dock_id = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
         if (force_default && !dock_built) { build_default_dock_layout(dock_id); dock_built = true; }
 
+        // Place the Pager and SMS tabs in the same dock group as Messages.
+        static bool grouped_msgs = false;
+        if (!grouped_msgs) {
+            ImGuiWindow *msgw = ImGui::FindWindowByName("Messages");
+            if (msgw && msgw->DockId) {
+                if (ImGuiWindow *w = ImGui::FindWindowByName("Pager"))
+                    ImGui::SetWindowDock(w, msgw->DockId, ImGuiCond_Always);
+                if (ImGuiWindow *w = ImGui::FindWindowByName("SMS"))
+                    ImGui::SetWindowDock(w, msgw->DockId, ImGuiCond_Always);
+                if (ImGuiWindow *w = ImGui::FindWindowByName("SBD"))
+                    ImGui::SetWindowDock(w, msgw->DockId, ImGuiCond_Always);
+                grouped_msgs = true;
+            }
+        }
+
+        // Make Messages the active tab in its dock group when the app opens.
+        static bool messages_focused = false;
+        if (!messages_focused) {
+            if (ImGui::FindWindowByName("Messages") != nullptr) {
+                ImGui::SetWindowFocus("Messages");
+                messages_focused = true;
+            }
+        }
+
         draw_menu_bar();
         draw_map_window();
         draw_playback_window();
@@ -1710,6 +1940,9 @@ int main(int argc, char **argv) {
         draw_voice_window();
         draw_acars_window();
         draw_aircraft_info_window();
+        draw_pager_window();
+        draw_sms_window();
+        draw_sbd_window();
         draw_source_window();
         draw_about_window();
 

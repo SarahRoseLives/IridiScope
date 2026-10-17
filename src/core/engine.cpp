@@ -1,6 +1,7 @@
 #include "core/engine.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 
 namespace iridi {
@@ -26,6 +27,7 @@ bool Engine::start(IqSource *source, float threshold) {
     total_samples_.store(source->total_samples());
     samples_.store(0);
     done_.store(false);
+    raw_base_ns_.store(0);
     paused_.store(false);
     running_.store(true);
     {
@@ -40,6 +42,7 @@ bool Engine::start(IqSource *source, float threshold) {
     }
     voice_.reset();
     acars_.reset();
+    pager_.reset();
     spectrum_seq_.store(0);
     spectrum_size_.store(0);
 
@@ -60,6 +63,25 @@ void Engine::stop() {
 }
 
 void Engine::on_frame(const ir_frame_info_t *info) {
+    if (raw_dump_.load()) {
+        static std::mutex dump_mtx;
+        std::lock_guard<std::mutex> lk(dump_mtx);
+        uint64_t base = raw_base_ns_.load();
+        if (base == 0) {
+            base = info->timestamp_ns;
+            raw_base_ns_.store(base);
+        }
+        unsigned long long ms =
+            info->timestamp_ns >= base ? (info->timestamp_ns - base) / 1000000ULL : 0ULL;
+        // iridium-toolkit RAW format:
+        // RAW: <name> <mstime> <freq> A:OK L:<id> <conf>% <level> <len> <bits>
+        printf("RAW: i-0-t1 %llu %.0f A:OK L:0 %d%% %.6f %d ", ms, info->frequency,
+               info->confidence, info->level, info->n_symbols);
+        if (info->bits)
+            for (int i = 0; i < info->n_bits; i++) putchar(info->bits[i] ? '1' : '0');
+        putchar('\n');
+    }
+
     FrameEvent ev;
     ev.frequency = info->frequency;
     ev.timestamp_ns = info->timestamp_ns;
@@ -88,6 +110,7 @@ void Engine::on_frame(const ir_frame_info_t *info) {
     last_ts_.store(pm.timestamp_ns);
     if (!pm.voice_payload.empty()) voice_.feed(pm);
     if (pm.has_ida) acars_.feed(pm);
+    if (pm.has_msg) pager_.feed(pm);
 
     std::lock_guard<std::mutex> lk(mtx_);
     frames_.push_back(ev);

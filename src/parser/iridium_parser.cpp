@@ -277,6 +277,130 @@ static void body_ida(Frame &f, ParsedMessage &out) {
     out.pretty = buf;
 }
 
+static void body_ims(Frame &f, ParsedMessage &out) {
+    out.type = "IMS";
+    out.has_ims = true;
+    const Bits &bits = f.descrambled.empty() ? Bits() : f.descrambled[0];
+    std::vector<Bits> blocks = slice(bits, 21);
+    if (irid_debug) fprintf(stderr, "[ims] enter bits=%zu blocks=%zu\n", bits.size(), blocks.size());
+    if (blocks.empty()) { out.pretty = "IMS"; return; }
+
+    const Bits &h = blocks[0];
+    if ((int)h.size() < 21) { out.pretty = "IMS"; return; }
+    int ms_type = h[0] - '0';
+    int bch_blocks = bits_to_int(h, 15, 19);
+    bool groupA = (ms_type == 1);
+    if (irid_debug)
+        fprintf(stderr, "[ims] ms_type=%d bch_blocks=%d h=%s\n", ms_type, bch_blocks, h.c_str());
+    if (bch_blocks < 2) { out.pretty = "IMS (short)"; return; }
+
+    size_t want = (size_t)bch_blocks * 2;
+    if (blocks.size() > want) blocks.resize(want);
+
+    blocks.erase(blocks.begin()); // header block
+    if (groupA) {
+        if (blocks.size() < 2) { out.pretty = "IMS"; return; }
+        size_t pop = blocks.size() >= 4 ? 4 : 2; // block-header message
+        blocks.erase(blocks.begin(), blocks.begin() + pop);
+    }
+
+    // Up to two all-ones trailer blocks.
+    int trailers = 0;
+    while (!blocks.empty() && blocks.back().size() == 21 && blocks.back()[0] == '1') {
+        blocks.pop_back();
+        if (++trailers >= 2) break;
+    }
+    if (blocks.empty()) { out.pretty = "IMS"; return; }
+
+    // Body bit string: drop the leading "odd" bit of every 21-bit block.
+    std::string rest;
+    for (const Bits &b : blocks)
+        if (b.size() >= 21) rest += b.substr(1);
+    if (irid_debug)
+        fprintf(stderr, "[ims] after trailers blocks=%zu rest=%zu trailers=%d\n", blocks.size(),
+                rest.size(), trailers);
+    if (rest.size() <= 27) { out.pretty = "IMS"; return; }
+
+    Bits ricbits = rest.substr(0, 22);
+    std::reverse(ricbits.begin(), ricbits.end());
+    int ric = bits_to_int(ricbits);
+    int fmt = bits_to_int(rest, 22, 27);
+    rest = rest.substr(27);
+    if (irid_debug)
+        fprintf(stderr, "[ims] ric=%d fmt=%d rest_after=%zu\n", ric, fmt, rest.size());
+    if (rest.size() <= 16) { out.pretty = "IMS"; return; }
+    int seq = bits_to_int(rest, 0, 6);
+    rest = rest.substr(16); // msg_data
+
+    out.has_msg = true;
+    out.msg_ric = ric;
+    out.msg_fmt = fmt;
+    out.msg_seq = seq;
+    if (irid_debug)
+        fprintf(stderr, "[ims] ric=%d fmt=%d seq=%d rest=%zu\n", ric, fmt, seq, rest.size());
+
+    char buf[192];
+    if (fmt == 5) {
+        if (rest.size() < 5 + 8) { out.pretty = "MSG (short)"; return; }
+        int len_bit = rest[4] - '0';
+        rest = rest.substr(5);
+        int part = 0, parts = 0;
+        if (len_bit == 1) {
+            if (rest.size() < 4) return;
+            int lfl = bits_to_int(rest, 0, 4);
+            if (lfl < 1 || lfl > 2) return;
+            if (rest.size() < (size_t)(4 + 2 * lfl)) return;
+            part = bits_to_int(rest, 4, 4 + lfl);
+            parts = bits_to_int(rest, 4 + lfl, 4 + 2 * lfl);
+            rest = rest.substr(4 + 2 * lfl);
+        }
+        if (rest.size() < 8) return;
+        int csum = bits_to_int(rest, 1, 8);
+        rest = rest.substr(8);
+        auto chars = slice(rest, 7);
+        std::string txt;
+        std::vector<uint8_t> bytes;
+        for (const Bits &c : chars) {
+            if ((int)c.size() < 7) break;
+            int v = bits_to_int(c);
+            bytes.push_back((uint8_t)v);
+            if (v == 3) { /* ETX */ }
+            else if (v >= 32 && v < 127) txt += (char)v;
+            else { char t[8]; snprintf(t, sizeof(t), "[%d]", v); txt += t; }
+        }
+        out.msg_part = part;
+        out.msg_parts = parts;
+        out.msg_checksum = csum;
+        out.msg_bytes = std::move(bytes);
+        out.msg_text = txt;
+        int s = 0;
+        for (uint8_t b : out.msg_bytes) s = (s + b) % 128;
+        out.msg_csum_ok = (((~s) & 127) == csum);
+        snprintf(buf, sizeof(buf), "MSG ric:%07d fmt:%02d seq:%02d %d/%d csum:%s",
+                 ric, fmt, seq, part, parts, out.msg_csum_ok ? "OK" : "no");
+        out.pretty = buf;
+    } else if (fmt == 3) {
+        if (rest.size() < 1) return;
+        rest = rest.substr(1);
+        auto groups = slice(rest, 4);
+        std::string digits;
+        for (const Bits &g : groups) {
+            if ((int)g.size() < 4) break;
+            digits += "0123456789abcdef"[bits_to_int(g) & 0xF];
+        }
+        out.msg_part = 0;
+        out.msg_parts = 0;
+        out.msg_text = digits;
+        out.msg_csum_ok = true;
+        snprintf(buf, sizeof(buf), "MS3 ric:%07d fmt:%02d seq:%02d BCD:%s",
+                 ric, fmt, seq, digits.c_str());
+        out.pretty = buf;
+    } else {
+        snprintf(buf, sizeof(buf), "MSG ric:%07d fmt:%02d seq:%02d", ric, fmt, seq);
+        out.pretty = buf;
+    }
+}
+
 static void body_lcw(Frame &f, ParsedMessage &out) {
     // f.descrambled_bits holds the 312-bit data after LCW; ft set.
     const Bits &data = f.descrambled_bits;
@@ -445,7 +569,7 @@ bool parse_frame(const RawFrame &in, ParsedMessage &out) {
         f.descrambled.clear();
         for (auto &x : blocks) { Bits a, b; de_interleave(x, a, b); f.descrambled.push_back(a); f.descrambled.push_back(b); }
         f.descramble_extra = extra;
-        if (ecc_decode(f, messaging_bch_poly)) { out.type = "IMS"; out.pretty = "IMS"; }
+        if (ecc_decode(f, messaging_bch_poly)) body_ims(f, out);
         else { out.type = "IME"; out.pretty = "IME MS"; out.error = true; }
     } else if (f.msgtype == "TL") {
         out.type = "ITL";

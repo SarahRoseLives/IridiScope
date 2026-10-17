@@ -184,6 +184,7 @@ set(APP_SOURCES
   src/parser/fec.cpp
   src/parser/iridium_parser.cpp
   src/messages/acars.cpp
+  src/messages/pager.cpp
   src/ui/waterfall.cpp
   src/voice/voice_manager.cpp
   src/voice/audio.cpp
@@ -210,7 +211,7 @@ target_include_directories(IridiScope PRIVATE
 target_compile_definitions(IridiScope PRIVATE
   IRIDISCOPE_ASSETS="${CMAKE_SOURCE_DIR}/assets"
   IRIDISCOPE_VERSION_MAJOR=0
-  IRIDISCOPE_VERSION_MINOR=1
+  IRIDISCOPE_VERSION_MINOR=3
 )
 
 target_link_libraries(IridiScope PRIVATE glfw OpenGL::GL Threads::Threads)

@@ -51,6 +51,15 @@ struct ParsedMessage {
     std::vector<uint8_t> ida_data;
     std::string ida_text;    // SBD ASCII preview
 
+    // IMS / pager (MSG / MS3)
+    bool has_ims = false;
+    bool has_msg = false;
+    int msg_ric = 0, msg_fmt = 0, msg_seq = 0, msg_part = 0, msg_parts = 0;
+    int msg_checksum = 0;
+    bool msg_csum_ok = false;
+    std::vector<uint8_t> msg_bytes; // 7-bit characters (fmt 5)
+    std::string msg_text;           // ASCII preview (fmt 5) or BCD digits (fmt 3)
+
     bool error = false;
 
     // Voice payload bytes (VOC/VOD/VO6), for the voice subsystem.

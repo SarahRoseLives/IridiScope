@@ -2305,9 +2305,10 @@ void draw_source_window() {
             }
             ImGui::SameLine();
             ImGui::TextDisabled("%s", g_gsmtap_status.c_str());
-            ImGui::TextDisabled("Wireshark: udp.port == %d  |  %llu packets",
-                                g_gsmtap_port,
+            ImGui::TextDisabled("Wireshark filter: gsmtap  |  %llu packets",
                                 (unsigned long long)iridi::gsmtap_packets());
+            ImGui::TextDisabled("ICMP port-unreachable is normal until a local listener binds UDP %d.",
+                                g_gsmtap_port);
         }
 
         ImGui::Separator();

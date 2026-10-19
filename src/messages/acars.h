@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "parser/iridium_parser.h"
+#include "messages/l3.h"
 
 namespace iridi {
 
@@ -25,9 +26,16 @@ struct AcarsMessage {
     std::string label_desc;
     std::string bid;
     std::string seqn;
+    std::string sublabel;
+    std::string mfi;
+    std::string msg_num;
     std::string text;
     std::string raw_hex;   // SBD payload hex
     std::string errors;    // space-joined error tags
+    std::string arinc622_text;
+    std::string arinc622_json;
+    std::string arinc622_kind;
+    bool has_arinc622 = false;
     bool crc_ok = false;
     bool cont = false;
 };
@@ -53,7 +61,18 @@ struct SbdMessage {
     std::string preheader_hex;
     std::string payload_hex;
     std::string text;         // printable-ASCII preview of the payload
+    std::string info;         // decoded preheader (IMEI/MOMSN/MTMSN/CRC/...)
     bool acars = false;       // payload is an ACARS message
+    bool has_crc = false;     // SBD preheader carried a CRC
+    bool crc_ok = false;
+
+    // NAL10 position report (10-byte SBD payload).
+    bool has_nal = false;
+    double nal_lat = 0, nal_lon = 0;
+    int nal_pdop = 0, nal_seconds = 0;
+    bool nal_fix = false, nal_emergency = false, nal_emergency_ack = false,
+         nal_motion = false;
+    std::string nal_info;
 };
 
 // Decode a GSM 03.40 SMS TPDU (exposed for diagnostics).
@@ -68,11 +87,13 @@ public:
     std::vector<AcarsMessage> messages() const;
     std::vector<SmsMessage> sms_messages() const;
     std::vector<SbdMessage> sbd_messages() const;
+    std::vector<L3Message> l3_messages() const;
     uint64_t ida_assembled() const { return ida_ok_; }
     uint64_t sbd_packets() const { return sbd_cnt_; }
     uint64_t acars_count() const { return acars_cnt_; }
     uint64_t sms_count() const { return sms_cnt_; }
     uint64_t sbd_message_count() const { return sbd_msg_cnt_; }
+    uint64_t l3_count() const { return l3_cnt_; }
 
 private:
     struct SbdFrag {
@@ -105,12 +126,14 @@ private:
     std::deque<AcarsMessage> msgs_;
     std::deque<SmsMessage> sms_;
     std::deque<SbdMessage> sbd_msgs_;
+    std::deque<L3Message> l3_;
 
     double otime_ = -1e9;
     std::vector<uint8_t> odata_;
     double ofreq_ = 0;
     uint64_t ida_ok_ = 0, ida_frag_ = 0, ida_broken_ = 0;
     uint64_t sbd_cnt_ = 0, acars_cnt_ = 0, sms_cnt_ = 0, sbd_msg_cnt_ = 0;
+    uint64_t l3_cnt_ = 0;
 };
 
 } // namespace iridi

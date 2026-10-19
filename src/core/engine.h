@@ -39,6 +39,26 @@ struct Satellite {
     bool has_pos = false;   // true once a satellite ring-alert supplied a position
 };
 
+// Ground spot-beam position from a ring alert (Iridium reports the beam center
+// with a low altitude, alternating with the satellite subpoint).
+struct GroundBeam {
+    int sat = 0, beam = 0;
+    double lat = 0, lon = 0;
+    int alt_km = 0;
+    uint64_t last_seen_ns = 0;
+    int count = 0;
+    int pages = 0;          // TMSI pages seen in this beam
+    bool has_pos = false;
+};
+
+// One TMSI page from a ring alert.
+struct PageEvent {
+    uint64_t timestamp_ns = 0;
+    int sat = 0, beam = 0;
+    uint32_t tmsi = 0;
+    int msc_id = 0;
+};
+
 struct EngineStats {
     uint64_t samples = 0;
     uint64_t total_samples = 0;
@@ -86,12 +106,15 @@ public:
     int  fft_size() const { return pipe_ ? ir_pipeline_get_fft_size((ir_pipeline_t *)pipe_) : 0; }
     void set_avg_alpha(float a) { if (pipe_) ir_pipeline_set_avg_alpha((ir_pipeline_t *)pipe_, a); }
     void set_dc_block(bool on) { if (pipe_) ir_pipeline_set_dc_block((ir_pipeline_t *)pipe_, on ? 1 : 0); }
+    void set_center_frequency(double hz);
 
     std::vector<FrameEvent> recent_frames(size_t max_count) const;
 
     // Parsed messages and satellites (from the native parser).
     std::vector<irid::ParsedMessage> recent_messages(size_t max_count) const;
     std::vector<Satellite> satellites() const;
+    std::vector<GroundBeam> ground_beams() const;
+    std::vector<PageEvent> paging_events(size_t max_count) const;
     uint64_t parsed_count() const { return parsed_count_.load(); }
     uint64_t parse_error_count() const { return parse_error_count_.load(); }
 
@@ -137,6 +160,8 @@ private:
     std::deque<FrameEvent> frames_;
     std::deque<irid::ParsedMessage> messages_;
     std::unordered_map<int, Satellite> sats_;
+    std::unordered_map<int, GroundBeam> beams_;
+    std::deque<PageEvent> pages_;
 };
 
 } // namespace iridi

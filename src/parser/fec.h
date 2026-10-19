@@ -22,6 +22,10 @@ void slice_extra(const Bits &s, int n, std::vector<Bits> &blocks, Bits &extra);
 int  bits_to_int(const Bits &b);
 int  bits_to_int(const Bits &b, int from, int to); // int(b[from:to], 2)
 
+// DQPSK -> BPSK symbols (bitsparser.py de_dqpsk/split_qpsk).
+std::vector<int> de_dqpsk(const Bits &bits);
+void split_qpsk(const std::vector<int> &symbols, Bits &i_bits, Bits &q_bits);
+
 // ---- GF(2) division / BCH --------------------------------------------------
 int  nndivide(int poly, int num);
 int  ndivide(int poly, const Bits &bits);

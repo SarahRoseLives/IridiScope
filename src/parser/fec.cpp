@@ -4,6 +4,7 @@
 #include <array>
 #include <cstring>
 #include <unordered_map>
+#include <utility>
 
 namespace irid {
 
@@ -87,6 +88,32 @@ int bits_to_int(const Bits &b, int from, int to) {
     int v = 0;
     for (int i = from; i < to; i++) v = (v << 1) | (b[i] == '1' ? 1 : 0);
     return v;
+}
+
+std::vector<int> de_dqpsk(const Bits &bits) {
+    static const int imap[4] = {0, 1, 3, 2};
+    std::vector<int> symbols;
+    symbols.reserve(bits.size() / 2);
+    for (size_t i = 0; i + 1 < bits.size(); i += 2)
+        symbols.push_back(imap[(bits[i] - '0') * 2 + (bits[i + 1] - '0')]);
+    for (size_t c = 1; c < symbols.size(); c++)
+        symbols[c] = (symbols[c - 1] + symbols[c]) % 4;
+    return symbols;
+}
+
+void split_qpsk(const std::vector<int> &symbols, Bits &i_bits, Bits &q_bits) {
+    i_bits.clear();
+    q_bits.clear();
+    i_bits.reserve(symbols.size());
+    q_bits.reserve(symbols.size());
+    for (int s : symbols) {
+        switch (s) {
+        case 0: i_bits += '0'; q_bits += '0'; break;
+        case 1: i_bits += '1'; q_bits += '0'; break;
+        case 2: i_bits += '1'; q_bits += '1'; break;
+        default: i_bits += '0'; q_bits += '1'; break;
+        }
+    }
 }
 
 // ---- GF(2) division --------------------------------------------------------
@@ -262,11 +289,250 @@ uint16_t kermit_crc(const uint8_t *data, size_t n) {
 // TODO: full error/erasure decoding. Until implemented, rs_fix/rs6_fix report
 // "not correctable" so affected subtypes fall back (VO->VOC, IP->IIU). This
 // does not affect IRA/IBC/IDA/LCW parsing.
-bool rs_fix(const std::vector<uint8_t> &, std::vector<uint8_t> &, std::vector<uint8_t> &) {
-    return false;
+namespace {
+
+struct RsGf {
+    int charac = 255;
+    std::vector<int> ex, lg;
+
+    void init(int c_exp, int prim) {
+        charac = (1 << c_exp) - 1;
+        ex.assign((size_t)charac * 2, 0);
+        lg.assign((size_t)charac + 1, 0);
+        int x = 1;
+        for (int i = 0; i < charac; i++) {
+            ex[i] = x;
+            lg[x] = i;
+            x <<= 1;
+            if (x & (1 << c_exp)) x ^= prim;
+        }
+        for (int i = charac; i < charac * 2; i++) ex[i] = ex[i - charac];
+    }
+    int mul(int a, int b) const {
+        if (!a || !b) return 0;
+        return ex[lg[a] + lg[b]];
+    }
+    int div(int a, int b) const {
+        if (!a) return 0;
+        return ex[(lg[a] - lg[b] + charac) % charac];
+    }
+    int pow(int a, int n) const {
+        if (!a) return 0;
+        if (n == 0) return 1;
+        int e = (lg[a] * n) % charac;
+        if (e < 0) e += charac;
+        return ex[e];
+    }
+    int inv(int a) const { return ex[charac - lg[a]]; }
+};
+
+using Poly = std::vector<int>;
+
+Poly pscale(const Poly &p, int x, const RsGf &g) {
+    Poly r(p.size());
+    for (size_t i = 0; i < p.size(); i++) r[i] = g.mul(p[i], x);
+    return r;
 }
-bool rs6_fix(const std::vector<uint8_t> &, std::vector<uint8_t> &, std::vector<uint8_t> &) {
-    return false;
+
+Poly padd(const Poly &p, const Poly &q) {
+    Poly r(std::max(p.size(), q.size()), 0);
+    for (size_t i = 0; i < p.size(); i++) r[r.size() - p.size() + i] ^= p[i];
+    for (size_t i = 0; i < q.size(); i++) r[r.size() - q.size() + i] ^= q[i];
+    return r;
+}
+
+Poly pmul(const Poly &p, const Poly &q, const RsGf &g) {
+    if (p.empty() || q.empty()) return {};
+    Poly r(p.size() + q.size() - 1, 0);
+    for (size_t j = 0; j < q.size(); j++) {
+        if (!q[j]) continue;
+        for (size_t i = 0; i < p.size(); i++)
+            if (p[i]) r[i + j] ^= g.mul(p[i], q[j]);
+    }
+    return r;
+}
+
+std::pair<Poly, Poly> pdiv(const Poly &dividend, const Poly &divisor, const RsGf &g) {
+    Poly out = dividend;
+    for (size_t i = 0; i + divisor.size() <= out.size(); i++) {
+        int coef = out[i];
+        if (!coef) continue;
+        for (size_t j = 1; j < divisor.size(); j++)
+            if (divisor[j]) out[i + j] ^= g.mul(divisor[j], coef);
+    }
+    size_t sep = out.size() - (divisor.size() - 1);
+    Poly q(out.begin(), out.begin() + sep);
+    Poly r(out.begin() + sep, out.end());
+    return {q, r};
+}
+
+int peval(const Poly &p, int x, const RsGf &g) {
+    int y = p.empty() ? 0 : p[0];
+    for (size_t i = 1; i < p.size(); i++) y = g.mul(y, x) ^ p[i];
+    return y;
+}
+
+Poly reverse_poly(const Poly &p) { return Poly(p.rbegin(), p.rend()); }
+
+Poly calc_syndromes(const Poly &msg, int nsym, int fcr, const RsGf &g) {
+    Poly synd((size_t)nsym + 1, 0);
+    for (int i = 0; i < nsym; i++)
+        synd[i + 1] = peval(msg, g.pow(2, i + fcr), g);
+    return synd;
+}
+
+Poly find_errata_locator(const std::vector<int> &e_pos, const RsGf &g) {
+    Poly loc{1};
+    for (int i : e_pos) {
+        Poly t{g.pow(2, i), 1};
+        loc = pmul(loc, t, g);
+    }
+    return loc;
+}
+
+Poly find_error_evaluator(const Poly &synd, const Poly &err_loc, int nsym,
+                          const RsGf &g) {
+    Poly prod = pmul(synd, err_loc, g);
+    Poly divisor((size_t)nsym + 2, 0);
+    divisor[0] = 1;
+    return pdiv(prod, divisor, g).second;
+}
+
+std::vector<int> find_errors(const Poly &err_loc, int nmess, const RsGf &g) {
+    int errs = (int)err_loc.size() - 1;
+    std::vector<int> pos;
+    for (int i = 0; i < nmess; i++)
+        if (peval(err_loc, g.pow(2, i), g) == 0) pos.push_back(nmess - 1 - i);
+    if ((int)pos.size() != errs) return {};
+    return pos;
+}
+
+std::vector<int> forney_syndromes(const Poly &synd, const std::vector<int> &pos,
+                                  int nmess, const RsGf &g) {
+    std::vector<int> fsynd(synd.begin() + 1, synd.end());
+    for (int p : pos) {
+        int x = g.pow(2, nmess - 1 - p);
+        for (size_t j = 0; j + 1 < fsynd.size(); j++)
+            fsynd[j] = g.mul(fsynd[j], x) ^ fsynd[j + 1];
+    }
+    return fsynd;
+}
+
+Poly find_error_locator(const std::vector<int> &synd, int nsym, int erase_count,
+                        const RsGf &g) {
+    Poly err_loc{1}, old_loc{1};
+    int synd_shift = 0;
+    if ((int)synd.size() > nsym) synd_shift = (int)synd.size() - nsym;
+    for (int i = 0; i < nsym - erase_count; i++) {
+        int K = i + synd_shift;
+        int delta = synd[K];
+        for (size_t j = 1; j < err_loc.size(); j++) {
+            int idx = K - (int)j;
+            if (idx < 0) return {};
+            delta ^= g.mul(err_loc[err_loc.size() - 1 - j], synd[idx]);
+        }
+        old_loc.push_back(0);
+        if (delta) {
+            if (old_loc.size() > err_loc.size()) {
+                Poly new_loc = pscale(old_loc, delta, g);
+                old_loc = pscale(err_loc, g.inv(delta), g);
+                err_loc = new_loc;
+            }
+            err_loc = padd(err_loc, pscale(old_loc, delta, g));
+        }
+    }
+    size_t first = 0;
+    while (first < err_loc.size() && err_loc[first] == 0) first++;
+    if (first) err_loc.erase(err_loc.begin(), err_loc.begin() + first);
+    int errs = (int)err_loc.size() - 1;
+    if ((errs - erase_count) * 2 + erase_count > nsym) return {};
+    return err_loc;
+}
+
+Poly correct_errata(const Poly &msg_in, const Poly &synd,
+                    const std::vector<int> &err_pos, int fcr, const RsGf &g) {
+    Poly msg = msg_in;
+    std::vector<int> coef_pos;
+    for (int p : err_pos) coef_pos.push_back((int)msg.size() - 1 - p);
+    Poly err_loc = find_errata_locator(coef_pos, g);
+    Poly err_eval = find_error_evaluator(reverse_poly(synd), err_loc,
+                                         (int)err_loc.size() - 1, g);
+    err_eval = reverse_poly(err_eval);
+    std::vector<int> X;
+    for (int cp : coef_pos) X.push_back(g.pow(2, cp));
+
+    Poly E(msg.size(), 0);
+    for (size_t i = 0; i < X.size(); i++) {
+        int Xi_inv = g.inv(X[i]);
+        int denom = 1;
+        for (size_t j = 0; j < X.size(); j++) {
+            if (j == i) continue;
+            denom = g.mul(denom, 1 ^ g.mul(Xi_inv, X[j]));
+        }
+        int y = peval(reverse_poly(err_eval), Xi_inv, g);
+        y = g.mul(g.pow(X[i], 1 - fcr), y);
+        E[err_pos[i]] = g.div(y, denom);
+    }
+    return padd(msg, E);
+}
+
+bool correct_msg(const std::vector<uint8_t> &in, int nsym, int fcr,
+                 const std::vector<int> &erase_pos, const RsGf &g,
+                 std::vector<uint8_t> &msg, std::vector<uint8_t> &ecc) {
+    Poly msg_out(in.begin(), in.end());
+    for (int p : erase_pos)
+        if (p >= 0 && p < (int)msg_out.size()) msg_out[p] = 0;
+    Poly synd = calc_syndromes(msg_out, nsym, fcr, g);
+    bool any = false;
+    for (int s : synd) if (s) { any = true; break; }
+    if (!any) {
+        size_t k = msg_out.size() - nsym;
+        msg.assign(msg_out.begin(), msg_out.begin() + k);
+        ecc.assign(msg_out.begin() + k, msg_out.end());
+        return true;
+    }
+    std::vector<int> fsynd = forney_syndromes(synd, erase_pos, (int)msg_out.size(), g);
+    Poly err_loc = find_error_locator(fsynd, nsym, (int)erase_pos.size(), g);
+    if (err_loc.empty()) return false;
+    std::vector<int> err_pos = find_errors(reverse_poly(err_loc), (int)msg_out.size(), g);
+    if (err_pos.empty() && err_loc.size() > 1) return false;
+    std::vector<int> all = erase_pos;
+    all.insert(all.end(), err_pos.begin(), err_pos.end());
+    Poly corrected = correct_errata(msg_out, synd, all, fcr, g);
+    Poly check = calc_syndromes(corrected, nsym, fcr, g);
+    for (int s : check) if (s) return false;
+    size_t k = corrected.size() - nsym;
+    msg.assign(corrected.begin(), corrected.begin() + k);
+    ecc.assign(corrected.begin() + k, corrected.end());
+    return true;
+}
+
+} // namespace
+
+bool rs_fix(const std::vector<uint8_t> &in, std::vector<uint8_t> &msg,
+            std::vector<uint8_t> &crs) {
+    if (in.size() != 39) return false;
+    RsGf g;
+    g.init(8, 0x11d);
+    std::vector<uint8_t> data = in;
+    data.resize(47, 0);
+    std::vector<int> erasures;
+    for (int i = 39; i < 47; i++) erasures.push_back(i);
+    std::vector<uint8_t> ecc;
+    if (!correct_msg(data, 16, 0, erasures, g, msg, ecc)) return false;
+    crs.assign(ecc.begin(), ecc.begin() + 8);
+    return true;
+}
+
+bool rs6_fix(const std::vector<uint8_t> &in, std::vector<uint8_t> &msg,
+             std::vector<uint8_t> &crs) {
+    if (in.size() != 52) return false;
+    RsGf g;
+    g.init(6, 0x43);
+    std::vector<uint8_t> ecc;
+    if (!correct_msg(in, 10, 54, {}, g, msg, ecc)) return false;
+    crs.assign(ecc.begin(), ecc.end());
+    return true;
 }
 
 } // namespace irid

@@ -22,6 +22,7 @@ struct VoiceCall {
     int frames = 0;
     double error_ratio = 1.0;
     bool active = false;
+    std::string subtype; // VOC / VOD / VOZ / ...
     std::string wav_path;
     double duration_s = 0;
 };

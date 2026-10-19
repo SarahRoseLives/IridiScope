@@ -41,6 +41,8 @@ struct ir_pipeline {
     ir_frame_cb       cb;
     void             *user;
 
+    atomic_llong      center_hz;    /* current VFO center for frequency reporting */
+
     Blocking_Queue    burst_q;
     pthread_t         workers[IR_MAX_WORKERS];
     burst_downmix_t  *dm[IR_MAX_WORKERS];
@@ -134,6 +136,8 @@ static void *worker_main(void *arg) {
 
 static void on_burst_enqueue(burst_data_t *burst, void *user) {
     ir_pipeline_t *p = (ir_pipeline_t *)user;
+    /* The SDR may have been retuned after the detector was created. */
+    burst->center_frequency = (double)atomic_load(&p->center_hz);
     atomic_fetch_add(&p->bursts, 1);
     blocking_queue_put(&p->burst_q, burst);
 }
@@ -241,6 +245,7 @@ ir_pipeline_t *ir_pipeline_create(double center_freq, int sample_rate,
     p->user = user;
     p->avg_alpha = 0.6f;
     p->dc_block = 1;
+    atomic_store(&p->center_hz, (long long)llround(center_freq));
     atomic_store(&p->spec_req, IR_DEFAULT_FFT);
 
     burst_config_t cfg;
@@ -301,6 +306,10 @@ void ir_pipeline_set_avg_alpha(ir_pipeline_t *p, float alpha) {
     if (p) p->avg_alpha = alpha < 0 ? 0 : (alpha > 0.999f ? 0.999f : alpha);
 }
 void ir_pipeline_set_dc_block(ir_pipeline_t *p, int on) { if (p) p->dc_block = on; }
+
+void ir_pipeline_set_center(ir_pipeline_t *p, double hz) {
+    if (p) atomic_store(&p->center_hz, (long long)llround(hz));
+}
 
 uint64_t ir_pipeline_bursts(ir_pipeline_t *p)     { return p ? atomic_load(&p->bursts) : 0; }
 uint64_t ir_pipeline_frames_ok(ir_pipeline_t *p)  { return p ? atomic_load(&p->frames_ok) : 0; }

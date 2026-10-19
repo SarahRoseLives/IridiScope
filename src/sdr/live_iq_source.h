@@ -38,7 +38,9 @@ public:
     void wake() override;
 
     // --- Live controls (applied immediately when running) -------------------
+    void set_center_frequency(double hz);
     void set_sample_rate(double hz);
+    void clear_buffer(); // drop buffered samples after a retune / rate change
     void set_gain(double db); // <0 => AGC
     double gain() const { return gain_; }
     void set_ppm(double ppm);

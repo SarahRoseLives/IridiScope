@@ -19,11 +19,16 @@ public:
     void stop();
     bool playing() const { return playing_.load(); }
 
+    // Playback gain (1.0 = unity). Calls are peak-normalised before this.
+    void set_volume(float v);
+    float volume() const { return volume_.load(); }
+
     struct Impl; // public so the miniaudio callback can use it
 
 private:
     Impl *impl_ = nullptr;
     std::atomic<bool> playing_{false};
+    std::atomic<float> volume_{1.0f};
 };
 
 } // namespace iridi

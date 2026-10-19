@@ -35,6 +35,8 @@ bool Engine::start(IqSource *source, float threshold) {
         frames_.clear();
         messages_.clear();
         sats_.clear();
+        beams_.clear();
+        pages_.clear();
         spectrum_inst_.clear();
         spectrum_avg_.clear();
         parsed_count_.store(0);
@@ -127,12 +129,32 @@ void Engine::on_frame(const ir_frame_info_t *info) {
             s.lat = pm.ira_lat; s.lon = pm.ira_lon; s.alt_km = pm.ira_alt_km;
             s.has_pos = true;
         }
+        int key = (pm.ira_sat << 8) | (pm.ira_beam & 0xff);
+        GroundBeam &g = beams_[key];
+        g.sat = pm.ira_sat; g.beam = pm.ira_beam;
+        if (pm.ira_is_ground && pm.ira_alt_km < 100) {
+            g.lat = pm.ira_lat; g.lon = pm.ira_lon; g.alt_km = pm.ira_alt_km;
+            g.last_seen_ns = pm.timestamp_ns; g.count++; g.has_pos = true;
+        }
+        for (const auto &p : pm.ira_page_list) {
+            PageEvent e;
+            e.timestamp_ns = pm.timestamp_ns;
+            e.sat = pm.ira_sat; e.beam = pm.ira_beam;
+            e.tmsi = p.tmsi; e.msc_id = p.msc_id;
+            pages_.push_back(e);
+            g.pages++;
+            if (pages_.size() > 20000) pages_.pop_front();
+        }
     } else if (pm.has_ibc) {
         // IBC carries no position; only track presence/beam.
         Satellite &s = sats_[pm.ibc_sat];
         s.id = pm.ibc_sat; s.beam = pm.ibc_beam;
         s.last_seen_ns = pm.timestamp_ns; s.count++;
     }
+}
+
+void Engine::set_center_frequency(double hz) {
+    if (pipe_) ir_pipeline_set_center(static_cast<ir_pipeline_t *>(pipe_), hz);
 }
 
 void Engine::thread_main() {
@@ -250,6 +272,25 @@ std::vector<Satellite> Engine::satellites() const {
     std::vector<Satellite> out;
     out.reserve(sats_.size());
     for (auto &kv : sats_) out.push_back(kv.second);
+    return out;
+}
+
+std::vector<GroundBeam> Engine::ground_beams() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    std::vector<GroundBeam> out;
+    out.reserve(beams_.size());
+    for (const auto &kv : beams_)
+        if (kv.second.has_pos) out.push_back(kv.second);
+    return out;
+}
+
+std::vector<PageEvent> Engine::paging_events(size_t max_count) const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    std::vector<PageEvent> out;
+    size_t n = pages_.size();
+    size_t start = n > max_count ? n - max_count : 0;
+    out.reserve(n - start);
+    for (size_t i = start; i < n; i++) out.push_back(pages_[i]);
     return out;
 }
 

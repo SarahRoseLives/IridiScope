@@ -1,5 +1,7 @@
 #include "parser/iridium_parser.h"
 #include "parser/fec.h"
+#include "parser/itl_tables.h"
+#include "util/iritime.h"
 
 #include <algorithm>
 #include <cmath>
@@ -207,11 +209,40 @@ static void body_ira(Frame &f, ParsedMessage &out) {
     out.ira_sat = sat; out.ira_beam = beam;
     out.ira_lat = lat; out.ira_lon = lon;
     out.ira_alt_km = (int)(alt - 6378 + 23);
+    out.ira_rai = bits_to_int(b, 49, 56);
+    out.ira_bc_sb = bits_to_int(b, 58, 63);
+    out.ira_is_ground = out.ira_alt_km < 100;
     out.type = "IRA";
+
+    // Paging list: 42-bit PAGE entries after the 63-bit header. An all-ones
+    // page terminates the list (bitsparser.py IridiumRAMessage).
+    if (b.size() > 63) {
+        Bits msg = b.substr(63);
+        for (size_t off = 0; off + 42 <= msg.size(); off += 42) {
+            Bits page = msg.substr(off, 42);
+            if (page.find('0') == std::string::npos) break; // END marker
+            ParsedMessage::IraPage p;
+            p.tmsi = (uint32_t)bits_to_int(page, 0, 32);
+            p.msc_id = bits_to_int(page, 34, 39);
+            out.ira_page_list.push_back(p);
+        }
+    }
+    out.ira_pages = (int)out.ira_page_list.size();
+
     char buf[192];
-    snprintf(buf, sizeof(buf), "IRA sat:%03d beam:%02d pos=(%+.2f/%+.2f) alt=%03d",
-             sat, beam, lat, lon, out.ira_alt_km);
+    snprintf(buf, sizeof(buf), "IRA sat:%03d beam:%02d pos=(%+.2f/%+.2f) alt=%03d RAI:%02d bc_sb:%02d",
+             sat, beam, lat, lon, out.ira_alt_km, out.ira_rai, out.ira_bc_sb);
     out.pretty = buf;
+    if (!out.ira_page_list.empty()) {
+        char pb[64];
+        snprintf(pb, sizeof(pb), " P%02d:", out.ira_pages);
+        out.pretty += pb;
+        for (const auto &p : out.ira_page_list) {
+            snprintf(pb, sizeof(pb), " PAGE(tmsi:%08x msc_id:%02d)",
+                     (unsigned)p.tmsi, p.msc_id);
+            out.pretty += pb;
+        }
+    }
 }
 
 static void body_ibc(Frame &f, ParsedMessage &out) {
@@ -222,26 +253,203 @@ static void body_ibc(Frame &f, ParsedMessage &out) {
     out.type = "IBC";
     int bc_type = bits_to_int(f.header);
     out.ibc_type = bc_type;
-    if (bc_type == 0 && !blocks.empty()) {
-        const Bits &d = blocks[0];
-        int sat = bits_to_int(d, 0, 7);
-        int beam = bits_to_int(d, 7, 13);
-        out.has_ibc = true; out.ibc_sat = sat; out.ibc_beam = beam;
-        char buf[160];
-        snprintf(buf, sizeof(buf), "IBC sat:%03d cell:%02d slot:%d sv_blkn:%d",
-                 sat, beam, bits_to_int(d, 14, 15), bits_to_int(d, 15, 16));
-        out.pretty = buf;
-        if (blocks.size() > 1) {
-            const Bits &t = blocks[1];
-            int type = bits_to_int(t, 0, 6);
-            if (type == 1) {
-                out.ibc_iri_time = (uint32_t)bits_to_int(t, 10, 42);
-                out.ibc_has_time = 1;
-            }
+    out.pretty = "IBC";
+    if (bc_type != 0 || blocks.empty()) return;
+
+    const Bits &d = blocks[0];
+    out.has_ibc = true;
+    out.ibc_sat = bits_to_int(d, 0, 7);
+    out.ibc_beam = bits_to_int(d, 7, 13);
+    out.ibc_slot = bits_to_int(d, 14, 15);
+    out.ibc_sv_blocking = bits_to_int(d, 15, 16);
+    out.ibc_aq_classes = d.substr(16, 16);
+    out.ibc_aq_subband = bits_to_int(d, 32, 37);
+    out.ibc_aq_channel = bits_to_int(d, 37, 40);
+
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "IBC bc:%d sat:%03d cell:%02d slot:%d sv_blkn:%d aq_cl:%s aq_sb:%02d aq_ch:%d",
+             bc_type, out.ibc_sat, out.ibc_beam, out.ibc_slot, out.ibc_sv_blocking,
+             out.ibc_aq_classes.c_str(), out.ibc_aq_subband, out.ibc_aq_channel);
+    std::string pretty = buf;
+
+    if (blocks.size() > 1) {
+        const Bits &t = blocks[1];
+        int type = bits_to_int(t, 0, 6);
+        out.ibc_subtype = type;
+        if (type == 0) {
+            out.ibc_max_uplink_pwr = bits_to_int(t, 36, 42);
+            snprintf(buf, sizeof(buf), " max_uplink_pwr:%02d", out.ibc_max_uplink_pwr);
+            pretty += buf;
+        } else if (type == 1) {
+            out.ibc_iri_time = (uint32_t)bits_to_int(t, 10, 42);
+            out.ibc_has_time = 1;
+            pretty += " time:" + iridi::fmt_iritime(out.ibc_iri_time);
+        } else if (type == 2) {
+            out.ibc_tmsi_expiry = (uint32_t)bits_to_int(t, 10, 42);
+            out.ibc_has_tmsi_expiry = 1;
+            pretty += " tmsi_expiry:" + iridi::fmt_iritime(out.ibc_tmsi_expiry);
+        } else {
+            snprintf(buf, sizeof(buf), " st:%02d %s", type, t.c_str());
+            pretty += buf;
         }
-    } else {
-        out.pretty = "IBC";
     }
+
+    for (size_t bi = 2; bi < blocks.size(); bi++) {
+        const Bits &a = blocks[bi];
+        if ((int)a.size() < 42) break;
+        ParsedMessage::IbAssignment as;
+        as.type = bits_to_int(a, 0, 3);
+        if (a == Bits(42, '1') || a == "111000000000000000000000000000000000000000") {
+            as.empty = true;
+            pretty += " []";
+            out.ibc_assignments.push_back(as);
+            continue;
+        }
+        if (as.type == 0) {
+            as.random_id = bits_to_int(a, 3, 11);
+            as.timeslot = 1 + bits_to_int(a, 11, 13);
+            as.ul_sb = bits_to_int(a, 13, 18);
+            as.dl_sb = bits_to_int(a, 18, 23);
+            as.access = 1 + bits_to_int(a, 23, 26);
+            as.dtoa = bits_to_int(a, 26, 34);
+            if (as.dtoa > 128) as.dtoa -= 256;
+            as.dfoa = bits_to_int(a, 34, 40);
+            snprintf(buf, sizeof(buf),
+                     " [0 Rid:%03d ts:%d ul_sb:%02d dl_sb:%02d access:%d dtoa:%+04d dfoa:%02d %s]",
+                     as.random_id, as.timeslot, as.ul_sb, as.dl_sb, as.access,
+                     as.dtoa, as.dfoa, a.substr(40, 2).c_str());
+        } else {
+            as.raw = a.substr(3, 39);
+            snprintf(buf, sizeof(buf), " [%d %s]", as.type, as.raw.c_str());
+        }
+        pretty += buf;
+        out.ibc_assignments.push_back(as);
+    }
+
+    out.pretty = pretty;
+}
+
+static std::string itl_hex_bytes(const Bits &bits, size_t start, size_t nbits) {
+    static const char *h = "0123456789abcdef";
+    std::string out;
+    for (size_t i = start; i + 8 <= start + nbits && i + 8 <= bits.size(); i += 8) {
+        int v = bits_to_int(bits.substr(i, 8));
+        out += h[(v >> 4) & 0xf];
+        out += h[v & 0xf];
+    }
+    return out;
+}
+
+static std::string itl_two(int v) {
+    char b[8];
+    snprintf(b, sizeof(b), "%02d", v);
+    return b;
+}
+
+static std::string itl_three(int v) {
+    char b[8];
+    snprintf(b, sizeof(b), "%03d", v);
+    return b;
+}
+
+static void itl_map_sat(int num, int version, std::string &sat, std::string &msg) {
+    if (version == 2) {
+        if (num == 77) { sat = "---"; msg = "M08"; }
+        else if (num < 66) {
+            sat = "S" + itl_two(num % 11 + 1);
+            msg = "M" + itl_two(num / 11 + 1);
+        } else if (num >= 82 && num <= 84) {
+            sat = "R" + itl_two(((num - 82) % 3) + 1);
+            msg = "N01";
+        } else if (num >= 85 && num <= 95) {
+            sat = "S" + itl_two(num - 84);
+            msg = "N02";
+        } else if (num >= 96 && num <= 107) {
+            sat = "R" + itl_two(((num - 96) % 3) + 1);
+            msg = "N" + itl_two((num - 96) / 3 + 3);
+        } else if (num == 108) { sat = "---"; msg = "SSS"; }
+        else if (num == 111) { sat = "---"; msg = "N08"; }
+        else { sat = "---"; msg = itl_three(num); }
+    } else {
+        if (num < 88) {
+            sat = "S" + itl_two(num % 11 + 1);
+            msg = "M" + itl_two(num / 11 + 1);
+        } else {
+            sat = "?";
+            msg = itl_three(num);
+        }
+    }
+}
+
+static void body_itl(Frame &f, ParsedMessage &out) {
+    out.type = "ITL";
+    out.has_itl = true;
+    const Bits &data = f.descrambled_bits;
+    if (data.size() < 768) {
+        out.pretty = "ITL (short)";
+        return;
+    }
+
+    auto symbols = de_dqpsk(data);
+    Bits ibits, qbits;
+    split_qpsk(symbols, ibits, qbits);
+    std::string i0 = itl_hex_bytes(ibits, 0, 128);
+    std::string i1 = itl_hex_bytes(ibits, 128, 256);
+    std::string q[4];
+    for (int k = 0; k < 4; k++) q[k] = itl_hex_bytes(qbits, (size_t)k * 96, 96);
+
+    int version = -1;
+    for (int v = 0; v < 3; v++)
+        if (i0 == kItlPrsHdr[v]) { version = v; break; }
+    out.itl_version = version;
+    if (version != 1 && version != 2) {
+        out.pretty = "ITL V" + std::to_string(version) + " (raw)";
+        return;
+    }
+
+    int plane = 0;
+    if (version == 2) {
+        for (int p = 0; p < 6; p++)
+            if (i1 == kItlPrsPlanes[p]) { plane = p + 1; break; }
+    } else {
+        for (int p = 0; p < 6; p++)
+            if (i1 == kItlPrsPlanesV1[p]) { plane = p + 1; break; }
+    }
+    if (!plane) {
+        out.pretty = "ITL V" + std::to_string(version) + " (plane?)";
+        return;
+    }
+    out.itl_plane = plane;
+
+    int vals[4] = {0, 0, 0, 0};
+    for (int k = 0; k < 4; k++) {
+        int found = -1;
+        if (version == 2) {
+            for (int j = 0; j < 512; j++)
+                if (q[k] == kItlPrsList[j]) { found = j % 128; break; }
+        } else {
+            for (int j = 0; j < 128; j++)
+                if (q[k] == kItlPrsListV1[j]) { found = j; break; }
+        }
+        if (found < 0) {
+            out.pretty = "ITL V" + std::to_string(version) + " (PRS?)";
+            return;
+        }
+        vals[k] = found;
+    }
+
+    std::string sat, msg;
+    itl_map_sat(vals[0], version, sat, msg);
+    out.itl_sat = sat;
+    out.itl_msg = msg;
+    out.itl_words.assign(vals + 1, vals + 4);
+    out.itl_ok = 1;
+
+    char buf[256];
+    snprintf(buf, sizeof(buf), "ITL V%d OK P%d %s %s %03d %03d %03d",
+             version, plane, sat.c_str(), msg.c_str(), vals[1], vals[2], vals[3]);
+    out.pretty = buf;
 }
 
 static void body_ida(Frame &f, ParsedMessage &out) {
@@ -406,11 +614,60 @@ static void body_lcw(Frame &f, ParsedMessage &out) {
     const Bits &data = f.descrambled_bits;
     build_lcw_header(f);
     if (f.ft == 0) {
-        // VO
-        out.type = "VOC";
+        // VO: classify VDA / VO6 / VOD / VOZ / VOC (bitsparser.py IridiumVOMessage).
         auto chunks = slice(data, 8);
-        for (auto &c : chunks) out.voice_payload.push_back((uint8_t)bits_to_int(c));
-        out.pretty = "VOC " + f.lcw_header + " [" + to_hex(data.substr(0, std::min<size_t>(data.size(), 39 * 8))) + "]";
+        std::vector<uint8_t> pf, pr;
+        pf.reserve(chunks.size());
+        pr.reserve(chunks.size());
+        for (auto &c : chunks) {
+            if ((int)c.size() < 8) break;
+            uint8_t b = (uint8_t)bits_to_int(c);
+            pf.push_back(b);
+            uint8_t r = 0;
+            for (int k = 0; k < 8; k++) r = (uint8_t)((r << 1) | ((b >> k) & 1));
+            pr.push_back(r);
+        }
+        std::vector<uint8_t> p6;
+        auto six = slice(data.substr(0, std::min<size_t>(data.size(), 312)), 6);
+        for (auto &c : six)
+            if ((int)c.size() == 6) p6.push_back((uint8_t)bits_to_int(c));
+
+        std::string subtype = "VOC";
+        if (!pr.empty() && crc24_iip(pr.data(), pr.size()) == 0) {
+            subtype = "VDA";
+        } else {
+            std::vector<uint8_t> m6, c6;
+            if (rs6_fix(p6, m6, c6)) {
+                subtype = "VO6";
+            } else {
+                std::vector<uint8_t> md, cd;
+                if (rs_fix(pf, md, cd)) {
+                    subtype = "VOD";
+                    out.voice_payload = md;
+                    out.voice_payload.insert(out.voice_payload.end(), cd.begin(), cd.end());
+                } else {
+                    bool zeros = pf.size() >= 4;
+                    if (zeros) {
+                        for (size_t i = pf.size() - 4; i + 1 < pf.size(); i++)
+                            if (pf[i] != 0) { zeros = false; break; }
+                    }
+                    int sum = 0;
+                    for (uint8_t b : pf) sum = (sum + b) & 0xff;
+                    if (zeros && sum == 0) {
+                        subtype = "VOZ";
+                        out.voice_payload = pf;
+                    } else {
+                        subtype = "VOC";
+                        out.voice_payload = pf;
+                    }
+                }
+            }
+        }
+        out.type = subtype;
+        out.voice_subtype = subtype;
+        out.pretty = subtype + " " + f.lcw_header;
+        if (subtype == "VOC" || subtype == "VOZ" || subtype == "VOD")
+            out.pretty += " [" + to_hex(data.substr(0, std::min<size_t>(data.size(), 39 * 8))) + "]";
     } else if (f.ft == 1) {
         // IP
         std::vector<uint8_t> payload_r;
@@ -487,7 +744,8 @@ bool parse_frame(const RawFrame &in, ParsedMessage &out) {
     if ((int)data.size() >= 32 && data.compare(0, 32, header_messaging) == 0 &&
         f.frequency > f_simplex && !f.uplink)
         f.msgtype = "MS";
-    else if ((int)data.size() >= 96 && data.compare(0, 96, header_time_location) == 0 &&
+    else if ((int)data.size() >= 96 + 768 &&
+             bitdiff(data.substr(0, 96), header_time_location) < 4 &&
              f.frequency > f_simplex && !f.uplink)
         f.msgtype = "TL";
 
@@ -572,8 +830,8 @@ bool parse_frame(const RawFrame &in, ParsedMessage &out) {
         if (ecc_decode(f, messaging_bch_poly)) body_ims(f, out);
         else { out.type = "IME"; out.pretty = "IME MS"; out.error = true; }
     } else if (f.msgtype == "TL") {
-        out.type = "ITL";
-        out.pretty = "ITL";
+        f.descrambled_bits = data.substr(96, 768);
+        body_itl(f, out);
     } else if (f.msgtype == "LW") {
         Bits l1, l2, l3;
         de_interleave_lcw(data.substr(0, 46), l1, l2, l3);

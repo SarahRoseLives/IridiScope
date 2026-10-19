@@ -60,6 +60,10 @@ int  ir_pipeline_get_fft_size(ir_pipeline_t *p);
 void ir_pipeline_set_avg_alpha(ir_pipeline_t *p, float alpha);
 void ir_pipeline_set_dc_block(ir_pipeline_t *p, int on);
 
+/* Update the capture center frequency used for reported frame frequencies
+ * (call when the SDR VFO is retuned). */
+void ir_pipeline_set_center(ir_pipeline_t *p, double hz);
+
 uint64_t ir_pipeline_bursts(ir_pipeline_t *p);
 uint64_t ir_pipeline_frames_ok(ir_pipeline_t *p);
 uint64_t ir_pipeline_frames_fail(ir_pipeline_t *p);

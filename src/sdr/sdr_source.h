@@ -20,7 +20,7 @@ struct SdrDeviceInfo {
 };
 
 // Which SDR backend a LiveIqSource should use.
-enum class SdrKind { Sdrplay, HackRF, Airspy };
+enum class SdrKind { Sdrplay, HackRF, Airspy, RTL };
 
 // Called from the SDR read thread with interleaved float IQ, already converted
 // to [-1, 1].
@@ -65,6 +65,7 @@ public:
 std::unique_ptr<SdrSource> make_sdrplay_source();
 std::unique_ptr<SdrSource> make_hackrf_source();
 std::unique_ptr<SdrSource> make_airspy_source();
+std::unique_ptr<SdrSource> make_rtlsdr_source();
 
 // Dispatches to the backend factory for the given kind.
 std::unique_ptr<SdrSource> make_sdr_source(SdrKind kind);

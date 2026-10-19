@@ -1,16 +1,29 @@
 cmake_minimum_required(VERSION 3.16)
 project(IridiScope C CXX)
 
-# Embed the application icon (icon.ico in the project root). Windows uses the
-# "1" resource for the exe/taskbar; GLFW loads the named "GLFW_ICON" resource
-# for the window/titlebar.
+# Embed resources in the executable so the app does not depend on an absolute
+# source-tree path at runtime. The map falls back to an external copy next to
+# the executable if one is present.
+set(IRIDISCOPE_ICON "${CMAKE_SOURCE_DIR}/icon.ico")
+set(IRIDISCOPE_WORLDMAP "${CMAKE_SOURCE_DIR}/assets/worldmap.jpg")
+set(IRIDISCOPE_DEFAULT_LAYOUT "${CMAKE_SOURCE_DIR}/assets/default_layout.ini")
+set(IRIDISCOPE_ICON_RES "")
+set(IRIDISCOPE_ASSET_RES "")
+if(EXISTS "${IRIDISCOPE_ICON}")
+  set(IRIDISCOPE_ICON_RES
+      "GLFW_ICON ICON \"${IRIDISCOPE_ICON}\"\n1 ICON \"${IRIDISCOPE_ICON}\"")
+endif()
+if(EXISTS "${IRIDISCOPE_WORLDMAP}" AND EXISTS "${IRIDISCOPE_DEFAULT_LAYOUT}")
+  set(IRIDISCOPE_ASSET_RES
+      "100 RCDATA \"${IRIDISCOPE_WORLDMAP}\"\n101 RCDATA \"${IRIDISCOPE_DEFAULT_LAYOUT}\"")
+endif()
+
 set(IRIDISCOPE_RC "")
-if(EXISTS "${CMAKE_SOURCE_DIR}/icon.ico")
+if(IRIDISCOPE_ICON_RES OR IRIDISCOPE_ASSET_RES)
   enable_language(RC)
-  set(IRIDISCOPE_ICON "${CMAKE_SOURCE_DIR}/icon.ico")
   configure_file("${CMAKE_SOURCE_DIR}/app.rc.in" "${CMAKE_BINARY_DIR}/app.rc" @ONLY)
   set(IRIDISCOPE_RC "${CMAKE_BINARY_DIR}/app.rc")
-  message(STATUS "Embedding application icon: ${IRIDISCOPE_ICON}")
+  message(STATUS "Embedding application resources")
 endif()
 
 set(CMAKE_C_STANDARD 99)
@@ -120,6 +133,28 @@ else()
   message(STATUS "Airspy library not found - Airspy source disabled")
 endif()
 
+# ---- RTL-SDR (optional native source) -------------------------------------
+find_path(RTLSDR_INCLUDE_DIR NAMES rtl-sdr.h)
+find_library(RTLSDR_LIBRARY NAMES rtlsdr librtlsdr)
+set(RTLSDR_FOUND FALSE)
+if(RTLSDR_INCLUDE_DIR AND RTLSDR_LIBRARY)
+  set(RTLSDR_FOUND TRUE)
+  message(STATUS "RTL-SDR library found: ${RTLSDR_LIBRARY}")
+else()
+  message(STATUS "RTL-SDR library not found - RTL-SDR source disabled")
+endif()
+
+# ---- libacars-2 (optional ACARS / ARINC-622 decoder) ----------------------
+find_path(LIBACARS_INCLUDE_DIR NAMES libacars/libacars.h PATH_SUFFIXES libacars-2)
+find_library(LIBACARS_LIBRARY NAMES acars-2 acars libacars-2 libacars)
+set(LIBACARS_FOUND FALSE)
+if(LIBACARS_INCLUDE_DIR AND LIBACARS_LIBRARY)
+  set(LIBACARS_FOUND TRUE)
+  message(STATUS "libacars found: ${LIBACARS_LIBRARY}")
+else()
+  message(STATUS "libacars not found - ARINC-622 decoding disabled")
+endif()
+
 # ---- Vendored iridium-sniffer DSP core ------------------------------------
 set(CORE_DIR ${CMAKE_SOURCE_DIR}/references/iridium-sniffer)
 set(CORE_SOURCES
@@ -183,9 +218,12 @@ set(APP_SOURCES
   src/update/version_check.cpp
   src/parser/fec.cpp
   src/parser/iridium_parser.cpp
+  src/parser/itl_tables.cpp
   src/messages/acars.cpp
   src/messages/pager.cpp
+  src/messages/l3.cpp
   src/ui/waterfall.cpp
+  src/util/iritime.cpp
   src/voice/voice_manager.cpp
   src/voice/audio.cpp
   src/voice/miniaudio_impl.c
@@ -213,6 +251,13 @@ target_compile_definitions(IridiScope PRIVATE
   IRIDISCOPE_VERSION_MAJOR=0
   IRIDISCOPE_VERSION_MINOR=3
 )
+
+# Also place the assets next to the executable so users can override the map
+# and so packaged builds have a visible assets folder.
+add_custom_command(TARGET IridiScope POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+          "${CMAKE_SOURCE_DIR}/assets" "$<TARGET_FILE_DIR:IridiScope>/assets"
+  COMMENT "Copying assets")
 
 target_link_libraries(IridiScope PRIVATE glfw OpenGL::GL Threads::Threads)
 
@@ -245,6 +290,22 @@ if(AIRSPY_FOUND)
   target_link_libraries(IridiScope PRIVATE ${AIRSPY_LIBRARY})
 endif()
 
+# RTL-SDR: compile the backend and link only when librtlsdr is present.
+if(RTLSDR_FOUND)
+  target_sources(IridiScope PRIVATE src/sdr/rtlsdr_source.cpp)
+  target_compile_definitions(IridiScope PRIVATE HAS_RTLSDR=1)
+  target_include_directories(IridiScope PRIVATE ${RTLSDR_INCLUDE_DIR})
+  target_link_libraries(IridiScope PRIVATE ${RTLSDR_LIBRARY})
+endif()
+
+# libacars-2: optional ARINC-622 / ADS-C / CPDLC decoding.
+target_sources(IridiScope PRIVATE src/acars/libacars_bridge.cpp)
+if(LIBACARS_FOUND)
+  target_compile_definitions(IridiScope PRIVATE HAS_LIBACARS=1)
+  target_include_directories(IridiScope PRIVATE ${LIBACARS_INCLUDE_DIR})
+  target_link_libraries(IridiScope PRIVATE ${LIBACARS_LIBRARY})
+endif()
+
 if(MINGW)
   target_link_libraries(IridiScope PRIVATE
     gdi32 user32 shell32 comdlg32 winmm ws2_32 winhttp)
@@ -263,6 +324,14 @@ if(MINGW)
   endif()
   if(AIRSPY_FOUND)
     list(APPEND MINGW_RUNTIME_DLLS libairspy.dll)
+  endif()
+  if(RTLSDR_FOUND)
+    list(APPEND MINGW_RUNTIME_DLLS librtlsdr.dll libusb-1.0.dll)
+  endif()
+  if(LIBACARS_FOUND)
+    list(APPEND MINGW_RUNTIME_DLLS
+      libacars-2.dll libjansson-4.dll libxml2-16.dll zlib1.dll
+      libiconv-2.dll liblzma-5.dll)
   endif()
   foreach(dll ${MINGW_RUNTIME_DLLS})
     if(EXISTS "${MINGW_BIN_DIR}/${dll}")

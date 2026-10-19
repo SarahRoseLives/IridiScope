@@ -37,13 +37,38 @@ struct ParsedMessage {
     // Ring alert
     bool has_ira = false;
     int ira_sat = 0, ira_beam = 0, ira_alt_km = 0, ira_pages = 0;
+    int ira_rai = 0, ira_bc_sb = 0;
+    bool ira_is_ground = false;
     double ira_lat = 0, ira_lon = 0;
+    struct IraPage {
+        uint32_t tmsi = 0;
+        int msc_id = 0;
+    };
+    std::vector<IraPage> ira_page_list;
 
     // Broadcast channel
     bool has_ibc = false;
     int ibc_sat = 0, ibc_beam = 0, ibc_type = -1;
-    uint32_t ibc_iri_time = 0;
-    int ibc_has_time = 0;
+    int ibc_subtype = -1;
+    int ibc_slot = 0, ibc_sv_blocking = 0;
+    int ibc_aq_subband = 0, ibc_aq_channel = 0;
+    std::string ibc_aq_classes;
+    int ibc_max_uplink_pwr = 0;
+    uint32_t ibc_iri_time = 0, ibc_tmsi_expiry = 0;
+    int ibc_has_time = 0, ibc_has_tmsi_expiry = 0;
+    struct IbAssignment {
+        int type = 0, random_id = 0, timeslot = 0;
+        int ul_sb = 0, dl_sb = 0, access = 0, dtoa = 0, dfoa = 0;
+        bool empty = false;
+        std::string raw;
+    };
+    std::vector<IbAssignment> ibc_assignments;
+
+    // Time & Location (ITL) message
+    bool has_itl = false;
+    int itl_version = -1, itl_plane = 0, itl_ok = 0;
+    std::string itl_sat, itl_msg;
+    std::vector<int> itl_words;
 
     // IDA / data
     bool has_ida = false;
@@ -64,6 +89,7 @@ struct ParsedMessage {
 
     // Voice payload bytes (VOC/VOD/VO6), for the voice subsystem.
     std::vector<uint8_t> voice_payload;
+    std::string voice_subtype; // VOC/VOD/VOZ/VDA/VO6
 };
 
 // Classify a raw demodulated frame. Returns true if a type was assigned.

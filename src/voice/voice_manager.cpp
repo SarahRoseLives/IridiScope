@@ -20,6 +20,7 @@ struct VoiceManager::Active {
     uint64_t start = 0, last = 0;
     struct ir77_ambe_decoder *dec = nullptr;
     std::vector<int16_t> pcm;
+    std::string subtype;
     int frames = 0; // subframes (2 per superframe)
     int ok = 0;
 };
@@ -72,6 +73,7 @@ void VoiceManager::finalize(std::unique_ptr<Active> &a, bool have_end) {
     c.end_ns = a->last;
     c.frames = a->frames;
     c.error_ratio = a->frames > 0 ? (1.0 - (double)a->ok / (double)a->frames) : 1.0;
+    c.subtype = a->subtype;
     c.duration_s = (double)a->pcm.size() / 8000.0;
     if (!have_end && c.error_ratio > 0.6) {
         // Rejected/aborted: keep the record but flag low quality via error ratio.
@@ -128,6 +130,8 @@ void VoiceManager::feed(const irid::ParsedMessage &pm) {
         a->frames += 2;
         a->ok += rv;
     }
+    if (a->subtype.empty() && !pm.voice_subtype.empty())
+        a->subtype = pm.voice_subtype;
     a->last = pm.timestamp_ns;
 }
 

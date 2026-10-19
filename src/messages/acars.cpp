@@ -1,9 +1,13 @@
 #include "messages/acars.h"
+#include "acars/libacars_bridge.h"
 #include "parser/fec.h"
+#include "util/iritime.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 
 namespace iridi {
 
@@ -221,14 +225,16 @@ bool decode_sms_tpdu(const std::vector<uint8_t> &t, SmsMessage &m) {
 
 void AcarsAssembler::reset() {
     std::lock_guard<std::mutex> lk(mtx_);
+    libacars_reset();
     ida_buf_.clear();
     multi_.clear();
     msgs_.clear();
     sms_.clear();
     sbd_msgs_.clear();
+    l3_.clear();
     otime_ = -1e9; odata_.clear(); ofreq_ = 0;
     ida_ok_ = ida_frag_ = ida_broken_ = 0;
-    sbd_cnt_ = acars_cnt_ = sms_cnt_ = sbd_msg_cnt_ = 0;
+    sbd_cnt_ = acars_cnt_ = sms_cnt_ = sbd_msg_cnt_ = l3_cnt_ = 0;
 }
 
 std::vector<SmsMessage> AcarsAssembler::sms_messages() const {
@@ -239,6 +245,11 @@ std::vector<SmsMessage> AcarsAssembler::sms_messages() const {
 std::vector<SbdMessage> AcarsAssembler::sbd_messages() const {
     std::lock_guard<std::mutex> lk(mtx_);
     return std::vector<SbdMessage>(sbd_msgs_.begin(), sbd_msgs_.end());
+}
+
+std::vector<L3Message> AcarsAssembler::l3_messages() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return std::vector<L3Message>(l3_.begin(), l3_.end());
 }
 
 std::vector<AcarsMessage> AcarsAssembler::messages() const {
@@ -322,9 +333,205 @@ void AcarsAssembler::decode_acars(const std::vector<uint8_t> &in, double time_s,
     m.reg = trim_right(printable(m.reg));
     m.flight = trim_right(m.flight);
 
+    AcarsDecoded ld = decode_acars_libacars(in, ul, time_s);
+    if (ld.ok) {
+        m.crc_ok = ld.crc_ok;
+        if (!ld.sublabel.empty()) m.sublabel = ld.sublabel;
+        if (!ld.mfi.empty()) m.mfi = ld.mfi;
+        if (!ld.msg_num.empty()) m.msg_num = ld.msg_num;
+        if (m.reg.empty() && !ld.reg.empty()) {
+            std::string r = ld.reg;
+            while (!r.empty() && r[0] == '.') r.erase(0, 1);
+            m.reg = trim_right(r);
+        }
+        if (m.flight.empty() && !ld.flight.empty()) m.flight = trim_right(ld.flight);
+        if (m.text.empty() && !ld.text.empty()) m.text = printable(ld.text);
+        m.arinc622_text = ld.arinc622_text;
+        m.arinc622_json = ld.arinc622_json;
+        m.arinc622_kind = ld.kind;
+        m.has_arinc622 = !ld.kind.empty();
+    }
+
     acars_cnt_++;
     msgs_.push_back(m);
     if (msgs_.size() > 2000) msgs_.pop_front();
+}
+
+// ---- SBD preheader / NAL10 -------------------------------------------------
+static uint16_t be16v(const std::vector<uint8_t> &v, size_t i) {
+    return (i + 1 < v.size()) ? (uint16_t)((v[i] << 8) | v[i + 1]) : 0;
+}
+static uint32_t be32v(const std::vector<uint8_t> &v, size_t i) {
+    if (i + 3 >= v.size()) return 0;
+    return ((uint32_t)v[i] << 24) | ((uint32_t)v[i + 1] << 16) |
+           ((uint32_t)v[i + 2] << 8) | v[i + 3];
+}
+static std::string bcd_digits(const std::vector<uint8_t> &v, size_t start, size_t count) {
+    static const char *d = "0123456789abcdef";
+    std::string s;
+    for (size_t i = start; i < start + count && i < v.size(); i++) {
+        s += d[v[i] & 0xf];
+        s += d[v[i] >> 4];
+    }
+    return s;
+}
+static uint16_t sbd_crc16(const uint8_t *d, size_t n) {
+    uint16_t crc = 0;
+    for (size_t i = 0; i < n; i++) {
+        crc ^= d[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc & 1) ? (uint16_t)((crc >> 1) ^ 0x8408) : (uint16_t)(crc >> 1);
+    }
+    return crc ^ 0xffff;
+}
+static void xyz_from5(const std::vector<uint8_t> &v, size_t start, int skip,
+                      int &x, int &y, int &z, double &lat, double &lon, double &alt) {
+    uint32_t val = 0;
+    for (size_t i = 0; i < 5 && start + i < v.size(); i++) val = (val << 8) | v[start + i];
+    int sb = 4 - skip;
+    x = (val >> (24 + sb)) & 0xfff; if (x > 0x800) x -= 0x1000;
+    y = (val >> (12 + sb)) & 0xfff; if (y > 0x800) y -= 0x1000;
+    z = (val >> sb) & 0xfff;        if (z > 0x800) z -= 0x1000;
+    lat = atan2((double)z, std::sqrt((double)x * x + (double)y * y)) * 180.0 / M_PI;
+    lon = atan2((double)y, (double)x) * 180.0 / M_PI;
+    alt = std::sqrt((double)x * x + (double)y * y + (double)z * z) * 4.0;
+}
+static std::string hexv(std::initializer_list<uint8_t> l) {
+    return hexns(std::vector<uint8_t>(l));
+}
+
+static void decode_sbd_preheader(const std::vector<uint8_t> &h,
+                                 const std::vector<uint8_t> &data, SbdMessage &m) {
+    std::string typ = m.type.substr(0, 4);
+    char buf[640];
+    if (typ == "0600" && h.size() >= 29) {
+        if (h[0] == 0x20) {
+            std::string sc = hexv({h[1], h[2], h[3]});
+            if (sc == "13f010") sc = "ISC";
+            else if (sc == "07f010") sc = "TSC";
+            int prot = h[4];
+            std::string bcd = bcd_digits(h, 5, 8);
+            std::string imei = bcd.size() > 1 ? bcd.substr(1) : bcd;
+            unsigned momsn = be16v(h, 13);
+            int msgct = h[15];
+            int addlen = 0;
+            std::string extra, session, flags;
+            if (prot == 0) {
+                extra = hexv({h[16], h[17]});
+                addlen = h[18];
+            } else if (prot == 1) {
+                extra = hexv({h[16]});
+                addlen = h[17];
+                flags = hexv({h[18]});
+            } else if (prot == 2) {
+                int st = h[16];
+                if (st == 0x00) session = "STD";
+                else if (st == 0x0c) session = "EXT";
+                else if (st == 0x1c) session = "EXA";
+                else if (st == 0x3c) session = "REG";
+                else if (st == 0x2c) session = "ARG";
+                else if (st == 0x20) session = "DET";
+                else session = "???";
+                addlen = h[17];
+                flags = hexv({h[18]});
+            } else {
+                addlen = h[17];
+            }
+            uint16_t pktcrc = (uint16_t)(h[19] | (h[20] << 8));
+            std::vector<uint8_t> cv = data;
+            cv.insert(cv.end(), h.begin() + 5, h.begin() + 13);
+            cv.insert(cv.end(), h.begin() + 13, h.begin() + 15);
+            cv.insert(cv.end(), h.begin() + 25, h.begin() + 29);
+            uint16_t crcval = sbd_crc16(cv.data(), cv.size());
+            m.has_crc = true;
+            m.crc_ok = (crcval == pktcrc);
+            int16_t doppler = (int16_t)be16v(h, 21);
+            unsigned delay = be16v(h, 23);
+            std::string ts = fmt_iritime(be32v(h, 25));
+            snprintf(buf, sizeof(buf),
+                     "SBD %s v%d imei:%s MOMSN=%u msgct:%d %s len=%d crc:%s[%04x] ds:%+d0Hz pd:%05uus t:%s",
+                     sc.c_str(), prot, imei.c_str(), momsn, msgct,
+                     session.empty() ? extra.c_str() : session.c_str(),
+                     addlen, m.crc_ok ? "OK" : "no", pktcrc,
+                     (int)doppler, delay, ts.c_str());
+            m.info = buf;
+            if (!flags.empty()) m.info += " flags:" + flags;
+            return;
+        }
+        if (h[0] == 0x10 || h[0] == 0x40 || h[0] == 0x70) {
+            const char *kind = h[0] == 0x10 ? "REG" : (h[0] == 0x40 ? "SMS" : "CAL");
+            std::string tmsi = hexv({h[4], h[5], h[6], h[7]});
+            std::string lac = hexv({h[8], h[9]});
+            std::string sca = hexv({h[10], h[11]});
+            uint32_t ver = be32v(h, 12);
+            int x, y, z; double lat, lon, alt;
+            xyz_from5(h, 16, 0, x, y, z, lat, lon, alt);
+            int16_t doppler = (int16_t)be16v(h, 21);
+            unsigned delay = be16v(h, 23);
+            std::string ts = fmt_iritime(be32v(h, 25));
+            snprintf(buf, sizeof(buf),
+                     "%s tmsi:%s lac:%s sca:%s v:%u xyz=(%+05d,%+05d,%+05d) ds:%+d0Hz pd:%05uus t:%s",
+                     kind, tmsi.c_str(), lac.c_str(), sca.c_str(), ver, x, y, z,
+                     (int)doppler, delay, ts.c_str());
+            m.info = buf;
+            return;
+        }
+    } else if (typ == "7608" && !h.empty()) {
+        if (h[0] == 0x26 && h.size() >= 7) {
+            snprintf(buf, sizeof(buf), "DL MTMSN=%u msgct:%d backlog=%d mid=%02x:%02x",
+                     be16v(h, 1), h[3], h[4], h[5], h[6]);
+            m.info = buf;
+            return;
+        }
+        if (h[0] == 0x20 && h.size() >= 5) {
+            snprintf(buf, sizeof(buf), "DL MTMSN=%u msgct:%d backlog=%d",
+                     be16v(h, 1), h[3], h[4]);
+            m.info = buf;
+            return;
+        }
+    } else if (!h.empty() && h[0] == 0x50) {
+        snprintf(buf, sizeof(buf), "ACK MTMSN=%u", be16v(h, 1));
+        m.info = buf;
+        return;
+    }
+    if (!h.empty()) m.info = "preheader " + hexns(h);
+}
+
+static bool decode_nal10(const std::vector<uint8_t> &data, SbdMessage &m) {
+    if (data.size() != 10) return false;
+    auto get = [&](int start, int amount) -> uint32_t {
+        uint32_t v = 0;
+        for (int i = 0; i < amount; i++) {
+            int idx = start + i;
+            if (data[idx / 8] & (1 << (idx % 8))) v += (1u << i);
+        }
+        return v;
+    };
+    uint32_t lat_raw = get(4, 25);
+    uint32_t lon_raw = get(29, 25);
+    uint32_t seconds = get(55, 17);
+    uint32_t pdop_i = get(72, 4);
+    uint32_t bits = get(76, 4);
+    if (lat_raw > 18000000 || lon_raw > 36000000 || seconds >= 86400 || pdop_i >= 8)
+        return false;
+    static const int pdop_tbl[8] = {1, 2, 5, 10, 20, 40, 70, 100};
+    m.has_nal = true;
+    m.nal_lat = ((double)lat_raw - 9000000.0) / 100000.0;
+    m.nal_lon = ((double)lon_raw - 18000000.0) / 100000.0;
+    m.nal_seconds = (int)seconds;
+    m.nal_pdop = pdop_tbl[pdop_i];
+    m.nal_fix = (bits & 1) != 0;
+    m.nal_emergency = (bits & 2) != 0;
+    m.nal_emergency_ack = (bits & 4) != 0;
+    m.nal_motion = (bits & 8) != 0;
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+             "lat=%.6f lon=%.6f pdop=%d emerg:%d/%d motion:%d fix:%d t=%02d:%02d:%02d",
+             m.nal_lat, m.nal_lon, m.nal_pdop, m.nal_emergency ? 1 : 0,
+             m.nal_emergency_ack ? 1 : 0, m.nal_motion ? 1 : 0, m.nal_fix ? 1 : 0,
+             (int)(seconds / 3600), (int)((seconds / 60) % 60), (int)(seconds % 60));
+    m.nal_info = buf;
+    return true;
 }
 
 // ---- SBD reassembly --------------------------------------------------------
@@ -344,6 +551,8 @@ void AcarsAssembler::record_sbd(const std::string &typ, const std::vector<uint8_
         m.text = printable(raw);
     }
     m.acars = (!data.empty() && data[0] == 0x01);
+    decode_sbd_preheader(prehdr, data, m);
+    decode_nal10(data, m);
     sbd_msgs_.push_back(std::move(m));
     if (sbd_msgs_.size() > 1000) sbd_msgs_.pop_front();
     sbd_msg_cnt_++;
@@ -351,6 +560,14 @@ void AcarsAssembler::record_sbd(const std::string &typ, const std::vector<uint8_
 
 void AcarsAssembler::emit_sbd_payload(const std::vector<uint8_t> &pin, double time_s, int ul,
                                       double frequency) {
+    // Decode the reassembled Um/L3 payload as well.
+    L3Message l3;
+    if (decode_l3(pin, time_s, ul, frequency, l3)) {
+        l3_.push_back(std::move(l3));
+        if (l3_.size() > 4000) l3_.pop_front();
+        l3_cnt_++;
+    }
+
     // SMS over GSM 04.11 CP-DATA: protocol discriminator 0x09/0x89, CP-DATA 0x01.
     if (pin.size() >= 2 && (pin[0] == 0x09 || pin[0] == 0x89) && pin[1] == 0x01) {
         std::vector<uint8_t> tpdu;

@@ -16,11 +16,16 @@ std::unique_ptr<SdrSource> make_hackrf_source() { return nullptr; }
 // Airspy support not built in: the backend factory is a no-op.
 std::unique_ptr<SdrSource> make_airspy_source() { return nullptr; }
 #endif
+#ifndef HAS_RTLSDR
+// RTL-SDR support not built in: the backend factory is a no-op.
+std::unique_ptr<SdrSource> make_rtlsdr_source() { return nullptr; }
+#endif
 
 std::unique_ptr<SdrSource> make_sdr_source(SdrKind kind) {
     switch (kind) {
     case SdrKind::HackRF: return make_hackrf_source();
     case SdrKind::Airspy: return make_airspy_source();
+    case SdrKind::RTL:    return make_rtlsdr_source();
     case SdrKind::Sdrplay:
     default:              return make_sdrplay_source();
     }
@@ -93,9 +98,20 @@ void LiveIqSource::wake() {
     cv_.notify_all();
 }
 
+void LiveIqSource::set_center_frequency(double hz) {
+    center_hz_ = hz;
+    if (sdr_) sdr_->setCenterFreq(hz);
+}
+
 void LiveIqSource::set_sample_rate(double hz) {
     sample_rate_ = hz;
     if (sdr_) sdr_->setSampleRate(hz);
+}
+
+void LiveIqSource::clear_buffer() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    head_ = 0;
+    count_ = 0;
 }
 
 void LiveIqSource::set_gain(double db) {

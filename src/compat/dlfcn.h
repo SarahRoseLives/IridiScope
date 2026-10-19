@@ -24,5 +24,8 @@ static inline int dlclose(void *handle) {
 }
 static inline char *dlerror(void) { return (char *)"dynamic loading disabled"; }
 
+#else
+// Not Windows: use the real system header.
+#include_next <dlfcn.h>
 #endif // _WIN32
 #endif // IRIDISCOPE_COMPAT_DLFCN_H

@@ -1,5 +1,6 @@
 // Update check over WinHTTP. Adapted from AirScope.
 #include "update/version_check.h"
+#include "util/http_get.h"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -180,10 +181,42 @@ void VersionCheck::run(std::string url, std::string local_version) {
     state_.store(st);
 }
 #else
-void VersionCheck::run(std::string, std::string) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    err_ = "unsupported platform";
-    state_.store(Error);
+// macOS / Linux: libcurl (see util/http_get.cpp).
+void VersionCheck::run(std::string url, std::string local_version) {
+    auto fail = [&](const std::string &e) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        err_ = e;
+        state_.store(Error);
+    };
+
+    std::string body, error;
+    int status = 0;
+    if (!http_get_portable(url, body, status, &error)) {
+        fail(error.empty() ? "request failed" : error);
+        return;
+    }
+    if (body.empty()) {
+        fail("request failed");
+        return;
+    }
+
+    std::string latest = json_string(body, "version");
+    std::string url_out = json_string(body, "product_url");
+
+    // Same decision as the Windows path: trust the published version only.
+    State st;
+    if (latest.empty()) {
+        st = UpToDate;
+    } else {
+        int c = cmp_version(local_version, latest);
+        st = (c > 0) ? Unreleased : (c == 0) ? UpToDate : UpdateAvailable;
+    }
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        latest_ = latest;
+        url_ = url_out.empty() ? url : url_out;
+    }
+    state_.store(st);
 }
 #endif
 

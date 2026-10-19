@@ -1,5 +1,6 @@
 #include "acars/aircraft_lookup.h"
 #include "util/json_mini.h"
+#include "util/http_get.h"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -110,9 +111,9 @@ bool http_get(const std::string &url, std::string &body, int &status) {
     return ok;
 }
 #else
-bool http_get(const std::string &, std::string &, int &status) {
-    status = 0;
-    return false;
+// macOS / Linux: libcurl (see util/http_get.cpp).
+bool http_get(const std::string &url, std::string &body, int &status) {
+    return http_get_portable(url, body, status);
 }
 #endif
 

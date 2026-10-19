@@ -2,9 +2,24 @@
 //
 // Milestone 2: the vendored DSP pipeline runs over the IQ file and drives a
 // live spectrum (ImPlot), scrolling waterfall, and burst statistics.
+#ifdef _WIN32
 #include <windows.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#else
+// macOS / Linux replacements for the Win32 APIs used below.
+#include <climits>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+extern char **environ;
+// MSVC/MinGW localtime_s(tm*, time_t*) -> POSIX localtime_r(time_t*, tm*)
+#define localtime_s(tmp, tp) localtime_r((tp), (tmp))
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -25,7 +40,11 @@
 #include <vector>
 
 #include <GLFW/glfw3.h>
+#if defined(__APPLE__)
+#include <OpenGL/gl.h>
+#else
 #include <GL/gl.h>
+#endif
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -253,11 +272,23 @@ void open_url(const char *url) {
 #ifdef _WIN32
     ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL);
 #else
-    (void)url;
+    if (!url || strncmp(url, "http", 4) != 0) return; // only web links
+#if defined(__APPLE__)
+    const char *opener = "open";
+#else
+    const char *opener = "xdg-open";
+#endif
+    // posix_spawnp: no shell involved, so the URL can't inject commands.
+    char *args[] = {(char *)opener, (char *)url, nullptr};
+    pid_t pid;
+    if (posix_spawnp(&pid, opener, nullptr, nullptr, args, environ) == 0) {
+        std::thread([pid] { int st; waitpid(pid, &st, 0); }).detach();
+    }
 #endif
 }
 
 // ---- map texture loading ---------------------------------------------------
+#ifdef _WIN32
 static std::wstring exe_directory() {
     std::vector<wchar_t> buf(32768);
     DWORD n = GetModuleFileNameW(nullptr, buf.data(), (DWORD)buf.size());
@@ -299,6 +330,73 @@ static bool read_resource_bytes(int id, std::vector<unsigned char> &out) {
                static_cast<unsigned char *>(data) + size);
     return true;
 }
+#else // !_WIN32
+// Directory containing the executable (resolving symlinks).
+static std::string exe_directory() {
+    char buf[PATH_MAX] = {0};
+#if defined(__APPLE__)
+    uint32_t sz = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &sz) != 0) return ".";
+#else
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return ".";
+    buf[n] = 0;
+#endif
+    char real[PATH_MAX] = {0};
+    std::string p = realpath(buf, real) ? std::string(real) : std::string(buf);
+    size_t pos = p.find_last_of('/');
+    return pos == std::string::npos ? "." : p.substr(0, pos);
+}
+
+static bool file_exists(const std::string &path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0;
+}
+
+static bool read_file_bytes(const std::string &path, std::vector<unsigned char> &out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    f.seekg(0, std::ios::end);
+    std::streamoff size = f.tellg();
+    if (size <= 0 || size > 256LL * 1024 * 1024) return false;
+    f.seekg(0, std::ios::beg);
+    out.resize((size_t)size);
+    if (!f.read(reinterpret_cast<char *>(out.data()), size)) { out.clear(); return false; }
+    return true;
+}
+
+// Where the assets folder may live: next to the executable, inside a macOS
+// .app bundle (Contents/Resources/assets), or the source tree at build time.
+static std::vector<std::string> asset_dirs() {
+    std::string dir = exe_directory();
+    return {dir + "/assets", dir + "/../Resources/assets", IRIDISCOPE_ASSETS};
+}
+
+// Outside Windows there are no embedded resources; assets are files.
+static bool read_resource_bytes(int, std::vector<unsigned char> &) { return false; }
+
+// A Finder/Dock launch starts with cwd "/" (read-only). IridiScope writes its
+// layout (iridiscope.ini) and voice recordings to the working directory, so
+// move to a per-user data folder in that case.
+static void ensure_writable_workdir() {
+    char cwd[PATH_MAX] = {0};
+    bool bad = !getcwd(cwd, sizeof(cwd)) || strcmp(cwd, "/") == 0 ||
+               access(cwd, W_OK) != 0;
+    if (!bad) return;
+    const char *home = getenv("HOME");
+    if (!home || !*home) return;
+#if defined(__APPLE__)
+    std::string base = std::string(home) + "/Library/Application Support";
+#else
+    const char *xdg = getenv("XDG_DATA_HOME");
+    std::string base = (xdg && *xdg) ? std::string(xdg) : std::string(home) + "/.local/share";
+    mkdir(base.c_str(), 0755);
+#endif
+    std::string dir = base + "/IridiScope";
+    mkdir(dir.c_str(), 0755);
+    if (chdir(dir.c_str()) == 0) fprintf(stderr, "Working directory: %s\n", dir.c_str());
+}
+#endif // _WIN32
 
 static void resize_rgba_box(const unsigned char *src, int sw, int sh,
                             unsigned char *dst, int dw, int dh) {
@@ -390,6 +488,7 @@ static GLuint load_texture_from_bytes(const unsigned char *data, int len,
 static GLuint load_map_texture(int &out_w, int &out_h) {
     // Prefer a user-provided copy next to the executable, then use the copy
     // embedded in the executable.
+#ifdef _WIN32
     std::wstring dir = exe_directory();
     std::wstring candidates[] = {
         dir + L"\\assets\\worldmap.jpg",
@@ -398,6 +497,14 @@ static GLuint load_map_texture(int &out_w, int &out_h) {
     for (const auto &p : candidates) {
         std::vector<unsigned char> bytes;
         if (!read_file_wide(p, bytes)) continue;
+#else
+    std::vector<std::string> candidates;
+    for (const auto &d : asset_dirs()) candidates.push_back(d + "/worldmap.jpg");
+    candidates.push_back(exe_directory() + "/worldmap.jpg");
+    for (const auto &p : candidates) {
+        std::vector<unsigned char> bytes;
+        if (!read_file_bytes(p, bytes)) continue;
+#endif
         GLuint tex = load_texture_from_bytes(bytes.data(), (int)bytes.size(),
                                              "external worldmap.jpg", out_w, out_h);
         if (tex) return tex;
@@ -412,6 +519,7 @@ static GLuint load_map_texture(int &out_w, int &out_h) {
     return 0;
 }
 
+#ifdef _WIN32
 std::string open_file_dialog() {
     char filename[MAX_PATH] = {0};
     OPENFILENAMEA ofn;
@@ -445,6 +553,79 @@ std::string save_file_dialog() {
     if (GetSaveFileNameA(&ofn)) return std::string(filename);
     return std::string();
 }
+#else // !_WIN32
+// Run a fixed command line and return its first output line ("" on cancel).
+// Only constant strings and digits are ever placed in the command.
+static std::string run_dialog_command(const std::string &cmd) {
+    FILE *p = popen(cmd.c_str(), "r");
+    if (!p) return std::string();
+    std::string out;
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), p)) out += buf;
+    int rc = pclose(p);
+    if (rc != 0) return std::string();
+    size_t nl = out.find('\n');
+    if (nl != std::string::npos) out.resize(nl);
+    return out;
+}
+
+static bool have_program(const char *name) {
+    std::string cmd = std::string("command -v ") + name + " >/dev/null 2>&1";
+    return system(cmd.c_str()) == 0;
+}
+
+std::string open_file_dialog() {
+#if defined(__APPLE__)
+    // Native macOS "choose file" panel via AppleScript.
+    return run_dialog_command(
+        "osascript -e 'activate' -e 'POSIX path of (choose file with prompt "
+        "\"Open IQ recording (.wav .cf32 .ci16 .ci8 .cfile .raw)\")' 2>/dev/null");
+#else
+    if (have_program("zenity"))
+        return run_dialog_command(
+            "zenity --file-selection --title='Open IQ recording' "
+            "--file-filter='IQ files | *.wav *.cf32 *.ci16 *.ci8 *.cfile *.raw' "
+            "--file-filter='All files | *' 2>/dev/null");
+    if (have_program("kdialog"))
+        return run_dialog_command(
+            "kdialog --getopenfilename . '*.wav *.cf32 *.ci16 *.ci8 *.cfile *.raw' 2>/dev/null");
+    add_log("No file dialog available: install zenity or kdialog, "
+            "or pass the IQ file on the command line");
+    return std::string();
+#endif
+}
+
+std::string save_file_dialog() {
+    char name[64];
+    time_t now = time(nullptr);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    snprintf(name, sizeof(name), "iridiscope-%04d%02d%02d-%02d%02d%02d.csv",
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    std::string path;
+#if defined(__APPLE__)
+    path = run_dialog_command(
+        std::string("osascript -e 'activate' -e 'POSIX path of (choose file name "
+                    "with prompt \"Export CSV\" default name \"") + name +
+        "\")' 2>/dev/null");
+#else
+    if (have_program("zenity"))
+        path = run_dialog_command(std::string("zenity --file-selection --save "
+                                              "--confirm-overwrite --filename=") +
+                                  name + " 2>/dev/null");
+    else if (have_program("kdialog"))
+        path = run_dialog_command(std::string("kdialog --getsavefilename ") + name +
+                                  " 2>/dev/null");
+    else
+        path = name; // no dialog: save in the working directory
+#endif
+    if (!path.empty() && path.size() >= 4 &&
+        path.compare(path.size() - 4, 4, ".csv") != 0)
+        path += ".csv";
+    return path;
+}
+#endif // _WIN32
 
 static std::string csv_escape(const std::string &s) {
     if (s.find_first_of(",\"\r\n") == std::string::npos) return s;
@@ -2927,10 +3108,16 @@ int main(int argc, char **argv) {
     if (argc >= 3 && std::string(argv[1]) == "--pager")
         return pager_dump(argv[2], argc >= 4 ? atof(argv[3]) : 60.0);
 
+#ifndef _WIN32
+    ensure_writable_workdir();
+#endif
     if (!glfwInit()) { fprintf(stderr, "Failed to initialize GLFW\n"); return 1; }
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#if defined(__APPLE__)
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE); // required on macOS
+#endif
 
     g_window = glfwCreateWindow(1600, 900, "IridiScope", nullptr, nullptr);
     if (!g_window) { fprintf(stderr, "Failed to create GLFW window\n"); glfwTerminate(); return 1; }
@@ -2948,10 +3135,26 @@ int main(int argc, char **argv) {
     // shipped docking arrangement is the default.
     const char *ini_path = "iridiscope.ini";
     bool force_default = false;
+#ifdef _WIN32
     if (GetFileAttributesA(ini_path) == INVALID_FILE_ATTRIBUTES) {
         std::string def = std::string(IRIDISCOPE_ASSETS) + "/default_layout.ini";
         if (!CopyFileA(def.c_str(), ini_path, FALSE)) force_default = true;
     }
+#else
+    if (!file_exists(ini_path)) {
+        force_default = true;
+        for (const auto &d : asset_dirs()) {
+            std::vector<unsigned char> bytes;
+            if (!read_file_bytes(d + "/default_layout.ini", bytes)) continue;
+            std::ofstream o(ini_path, std::ios::binary);
+            if (o && o.write(reinterpret_cast<const char *>(bytes.data()),
+                             (std::streamsize)bytes.size())) {
+                force_default = false;
+                break;
+            }
+        }
+    }
+#endif
     io.IniFilename = ini_path;
     bool dock_built = false;
     apply_style();

@@ -46,6 +46,36 @@ not found, that source is simply disabled.
 Handy headless modes: `--info <file>`, `--scan <file> [seconds]`,
 `--sdr-list`, `--hrf-list`, `--ap-list`, `--check-update`.
 
+### macOS (Apple Silicon / Intel)
+
+Requirements: Xcode command-line tools and [Homebrew](https://brew.sh).
+For SDRplay devices, also install the SDRplay API for macOS.
+
+```bash
+bash scripts/build_macos.sh
+open build-macos/IridiScope.app
+```
+
+The script installs CMake, Ninja, FFTW, libhackrf, libairspy and librtlsdr
+from Homebrew and builds `build-macos/IridiScope.app` with the NEON DSP
+kernels on Apple Silicon. When started from Finder, the window layout and voice
+recordings are kept in `~/Library/Application Support/IridiScope`.
+
+### Linux
+
+```bash
+sudo apt install cmake ninja-build libfftw3-dev libcurl4-openssl-dev \
+  libgl-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+  libwayland-dev libxkbcommon-dev wayland-protocols \
+  libhackrf-dev libairspy-dev librtlsdr-dev zenity
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build && ./build/IridiScope
+```
+
+On macOS and Linux the update check and aircraft lookup use libcurl, and the
+file dialogs use the system picker (AppleScript on macOS, zenity or kdialog on
+Linux).
+
 ## Credits
 
 IridiScope is built on the work of others:

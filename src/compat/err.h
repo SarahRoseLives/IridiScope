@@ -3,5 +3,10 @@
 // resolves when the compat directory is on the include path.
 #ifndef IRIDISCOPE_COMPAT_ERR_H
 #define IRIDISCOPE_COMPAT_ERR_H
+#ifdef _WIN32
 #include "win_compat.h"
+#else
+// Not Windows: use the real BSD <err.h> (macOS, glibc).
+#include_next <err.h>
+#endif
 #endif

@@ -24,3 +24,4 @@ build-*/
 
 # GLFW source is vendored extracted (third_party/glfw); its tarball is redundant.
 /third_party/glfw-3.4.tar.gz
+build-macos/

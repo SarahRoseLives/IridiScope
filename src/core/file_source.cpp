@@ -97,7 +97,11 @@ bool IqFileSource::open(const std::string &path, std::string &err) {
     fseeko(f, 0, SEEK_END);
     uint64_t file_size = (uint64_t)ftello(f);
 #endif
+#ifdef _WIN32
     _fseeki64(f, 0, SEEK_SET);
+#else
+    fseeko(f, 0, SEEK_SET);
+#endif
 
     info_ = IqFileInfo{};
     info_.path = path;

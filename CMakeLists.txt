@@ -19,7 +19,9 @@ if(EXISTS "${IRIDISCOPE_WORLDMAP}" AND EXISTS "${IRIDISCOPE_DEFAULT_LAYOUT}")
 endif()
 
 set(IRIDISCOPE_RC "")
-if(IRIDISCOPE_ICON_RES OR IRIDISCOPE_ASSET_RES)
+# Windows resources (.rc) only exist on Windows; on macOS/Linux the map and
+# default layout are read from the assets folder (or the .app bundle).
+if(WIN32 AND (IRIDISCOPE_ICON_RES OR IRIDISCOPE_ASSET_RES))
   enable_language(RC)
   configure_file("${CMAKE_SOURCE_DIR}/app.rc.in" "${CMAKE_BINARY_DIR}/app.rc" @ONLY)
   set(IRIDISCOPE_RC "${CMAKE_BINARY_DIR}/app.rc")
@@ -123,7 +125,8 @@ else()
 endif()
 
 # ---- Airspy (optional native source) --------------------------------------
-find_path(AIRSPY_INCLUDE_DIR NAMES airspy.h)
+# libairspy installs its header under include/libairspy/ on Linux and Homebrew.
+find_path(AIRSPY_INCLUDE_DIR NAMES airspy.h PATH_SUFFIXES libairspy)
 find_library(AIRSPY_LIBRARY NAMES airspy libairspy)
 set(AIRSPY_FOUND FALSE)
 if(AIRSPY_INCLUDE_DIR AND AIRSPY_LIBRARY)
@@ -164,21 +167,40 @@ set(CORE_SOURCES
   ${CORE_DIR}/fir_filter.c
   ${CORE_DIR}/window_func.c
   ${CORE_DIR}/simd_generic.c
-  ${CORE_DIR}/simd_sse42.c
-  ${CORE_DIR}/simd_avx2.c
   ${CMAKE_SOURCE_DIR}/src/iridium/engine_globals.c
   ${CMAKE_SOURCE_DIR}/src/iridium/pipeline_c.c
 )
 
-# Force-include the Windows compatibility shim into every C core file, and
-# give the SIMD kernels their ISA flags.
+# Pick the SIMD kernels for the target CPU. simd_init() selects the best tier
+# at runtime (CPUID on x86; NEON is always present on AArch64 / Apple Silicon).
+# On macOS, CMAKE_OSX_ARCHITECTURES (e.g. arm64) wins over the host processor.
+set(IRIDI_TARGET_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+  set(IRIDI_TARGET_ARCH "${CMAKE_OSX_ARCHITECTURES}")
+endif()
+set(IRIDI_SIMD_X86 FALSE)
+if(IRIDI_TARGET_ARCH MATCHES "x86_64|AMD64|amd64|i[3-6]86|x86")
+  set(IRIDI_SIMD_X86 TRUE)
+  list(APPEND CORE_SOURCES ${CORE_DIR}/simd_sse42.c ${CORE_DIR}/simd_avx2.c)
+  message(STATUS "SIMD: SSE4.2 + AVX2+FMA kernels (runtime-detected)")
+elseif(IRIDI_TARGET_ARCH MATCHES "arm64|aarch64|AARCH64|ARM64")
+  list(APPEND CORE_SOURCES ${CORE_DIR}/simd_neon.c)
+  message(STATUS "SIMD: NEON kernels (AArch64)")
+else()
+  message(STATUS "SIMD: scalar kernels only (${IRIDI_TARGET_ARCH})")
+endif()
+
+# Force-include the compatibility shim into every C core file (it is empty
+# outside Windows), and give the x86 SIMD kernels their ISA flags.
 set(WIN_COMPAT ${CMAKE_SOURCE_DIR}/src/compat/win_compat.h)
 set_source_files_properties(${CORE_SOURCES} PROPERTIES
   COMPILE_OPTIONS "-include;${WIN_COMPAT}")
-set_source_files_properties(${CORE_DIR}/simd_sse42.c PROPERTIES
-  COMPILE_OPTIONS "-include;${WIN_COMPAT};-msse4.2")
-set_source_files_properties(${CORE_DIR}/simd_avx2.c PROPERTIES
-  COMPILE_OPTIONS "-include;${WIN_COMPAT};-mavx2;-mfma")
+if(IRIDI_SIMD_X86)
+  set_source_files_properties(${CORE_DIR}/simd_sse42.c PROPERTIES
+    COMPILE_OPTIONS "-include;${WIN_COMPAT};-msse4.2")
+  set_source_files_properties(${CORE_DIR}/simd_avx2.c PROPERTIES
+    COMPILE_OPTIONS "-include;${WIN_COMPAT};-mavx2;-mfma")
+endif()
 
 # ---- Dear ImGui + ImPlot (vendored) ---------------------------------------
 set(IMGUI_DIR  ${CMAKE_SOURCE_DIR}/third_party/imgui)
@@ -231,8 +253,30 @@ set(APP_SOURCES
   ${CODEC_SOURCES}
 )
 
+# Single source for the version (used by the app and the macOS bundle).
+set(IRIDISCOPE_VERSION_MAJOR 0)
+set(IRIDISCOPE_VERSION_MINOR 5)
+
+# Cross-platform HTTP (update check, aircraft lookup) uses libcurl outside
+# Windows; Windows keeps its native WinHTTP code.
+list(APPEND APP_SOURCES src/util/http_get.cpp)
+
+# On macOS, build a double-clickable IridiScope.app by default.
+if(APPLE)
+  option(IRIDISCOPE_MACOS_BUNDLE "Build IridiScope as a macOS .app bundle" ON)
+endif()
+
 # WIN32 => Windows GUI subsystem: no console window on launch.
-add_executable(IridiScope WIN32 ${APP_SOURCES} ${IMGUI_SOURCES} ${CORE_SOURCES} ${IRIDISCOPE_RC})
+if(APPLE AND IRIDISCOPE_MACOS_BUNDLE)
+  add_executable(IridiScope MACOSX_BUNDLE ${APP_SOURCES} ${IMGUI_SOURCES} ${CORE_SOURCES})
+  set_target_properties(IridiScope PROPERTIES
+    MACOSX_BUNDLE_BUNDLE_NAME "IridiScope"
+    MACOSX_BUNDLE_GUI_IDENTIFIER "dev.sarahsforge.iridiscope"
+    MACOSX_BUNDLE_SHORT_VERSION_STRING "${IRIDISCOPE_VERSION_MAJOR}.${IRIDISCOPE_VERSION_MINOR}"
+    MACOSX_BUNDLE_BUNDLE_VERSION "${IRIDISCOPE_VERSION_MAJOR}.${IRIDISCOPE_VERSION_MINOR}")
+else()
+  add_executable(IridiScope WIN32 ${APP_SOURCES} ${IMGUI_SOURCES} ${CORE_SOURCES} ${IRIDISCOPE_RC})
+endif()
 
 target_include_directories(IridiScope PRIVATE
   src
@@ -249,18 +293,46 @@ target_include_directories(IridiScope PRIVATE
 
 target_compile_definitions(IridiScope PRIVATE
   IRIDISCOPE_ASSETS="${CMAKE_SOURCE_DIR}/assets"
-  IRIDISCOPE_VERSION_MAJOR=0
-  IRIDISCOPE_VERSION_MINOR=5
+  IRIDISCOPE_VERSION_MAJOR=${IRIDISCOPE_VERSION_MAJOR}
+  IRIDISCOPE_VERSION_MINOR=${IRIDISCOPE_VERSION_MINOR}
 )
 
 # Also place the assets next to the executable so users can override the map
 # and so packaged builds have a visible assets folder.
-add_custom_command(TARGET IridiScope POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_directory
-          "${CMAKE_SOURCE_DIR}/assets" "$<TARGET_FILE_DIR:IridiScope>/assets"
-  COMMENT "Copying assets")
+if(APPLE AND IRIDISCOPE_MACOS_BUNDLE)
+  # Inside the bundle: IridiScope.app/Contents/Resources/assets
+  add_custom_command(TARGET IridiScope POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/assets" "$<TARGET_FILE_DIR:IridiScope>/../Resources/assets"
+    COMMENT "Copying assets into the app bundle")
+else()
+  add_custom_command(TARGET IridiScope POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/assets" "$<TARGET_FILE_DIR:IridiScope>/assets"
+    COMMENT "Copying assets")
+endif()
 
 target_link_libraries(IridiScope PRIVATE glfw OpenGL::GL Threads::Threads)
+
+if(NOT WIN32)
+  find_package(CURL)
+  if(CURL_FOUND)
+    target_compile_definitions(IridiScope PRIVATE HAS_LIBCURL=1)
+    target_link_libraries(IridiScope PRIVATE CURL::libcurl)
+    message(STATUS "libcurl found - update check and aircraft lookup enabled")
+  else()
+    message(STATUS "libcurl not found - update check and aircraft lookup disabled")
+  endif()
+  target_link_libraries(IridiScope PRIVATE ${CMAKE_DL_LIBS} m)
+endif()
+
+if(APPLE)
+  # OpenGL is deprecated (but fully working) on macOS; silence the warnings.
+  target_compile_definitions(IridiScope PRIVATE GL_SILENCE_DEPRECATION)
+  # miniaudio's CoreAudio backend.
+  target_link_libraries(IridiScope PRIVATE
+    "-framework CoreFoundation" "-framework CoreAudio" "-framework AudioToolbox")
+endif()
 
 if(FFTW_LIBRARY AND FFTW_INCLUDE_DIR)
   target_include_directories(IridiScope PRIVATE ${FFTW_INCLUDE_DIR})
@@ -346,8 +418,8 @@ if(MINGW)
 endif()
 
 # Copy sdrplay_api.dll next to the executable so SDRplay devices work without
-# the API's bin directory on PATH.
-if(SDRPLAY_FOUND)
+# the API's bin directory on PATH (Windows only).
+if(WIN32 AND SDRPLAY_FOUND)
   get_filename_component(SDRPLAY_LIB_DIR "${SDRPLAY_LIBRARY}" DIRECTORY)
   find_file(SDRPLAY_RUNTIME NAMES sdrplay_api.dll
     HINTS "${SDRPLAY_LIB_DIR}"

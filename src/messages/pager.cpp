@@ -40,6 +40,7 @@ void PagerAssembler::expire(double now) {
 void PagerAssembler::emit(Entry &e) {
     PagerMessage m;
     m.timestamp_ns = e.timestamp_ns;
+    m.frequency = e.frequency;
     m.ric = e.ric;
     m.fmt = e.fmt;
     m.seq = e.seq;
@@ -102,6 +103,7 @@ void PagerAssembler::feed(const irid::ParsedMessage &pm) {
         e.fmt = pm.msg_fmt;
         e.seq = pm.msg_seq;
         e.parts = parts;
+        e.frequency = pm.frequency;
         e.have.assign(parts, 0);
         e.data.resize(parts);
         e.text.resize(parts);

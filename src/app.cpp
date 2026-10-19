@@ -16,6 +16,7 @@
 #include <cmath>
 #include <ctime>
 #include <deque>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -39,6 +40,7 @@
 #include "core/engine.h"
 #include "acars/aircraft_lookup.h"
 #include "sdr/live_iq_source.h"
+#include "output/gsmtap.h"
 #include "ui/waterfall.h"
 #include "update/version_check.h"
 #include "util/iritime.h"
@@ -179,10 +181,16 @@ std::thread g_rtl_scan_thread;
 std::vector<std::string> g_log;
 bool g_show_map = true;
 bool g_show_source = true;
+
+// GSMTAP output and decoded-data export.
+char g_gsmtap_host[64] = "127.0.0.1";
+int g_gsmtap_port = 4729;
+bool g_gsmtap_on = false;
+std::string g_gsmtap_status;
+std::string g_save_status;
 bool g_show_spectrum = true;
 bool g_show_waterfall = true;
-bool g_show_stats = true;
-bool g_show_bursts = false;
+bool g_show_bursts = true;
 bool g_show_messages = true;
 bool g_show_sats = true;
 bool g_show_voice = true;
@@ -412,6 +420,84 @@ std::string open_file_dialog() {
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (GetOpenFileNameA(&ofn)) return std::string(filename);
     return std::string();
+}
+
+std::string save_file_dialog() {
+    char filename[MAX_PATH];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(filename, sizeof(filename), "iridiscope-%04d%02d%02d-%02d%02d%02d.csv",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    OPENFILENAMEA ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = "CSV files (*.csv)\0*.csv\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrDefExt = "csv";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetSaveFileNameA(&ofn)) return std::string(filename);
+    return std::string();
+}
+
+static std::string csv_escape(const std::string &s) {
+    if (s.find_first_of(",\"\r\n") == std::string::npos) return s;
+    std::string o = "\"";
+    for (char c : s) {
+        if (c == '"') o += "\"\"";
+        else o += c;
+    }
+    o += "\"";
+    return o;
+}
+
+static std::string utc_iso(uint64_t ns) {
+    time_t t = (time_t)(ns / 1000000000ULL);
+    struct tm *tmv = gmtime(&t);
+    if (!tmv) return "";
+    char b[32];
+    strftime(b, sizeof(b), "%Y-%m-%dT%H:%M:%SZ", tmv);
+    return b;
+}
+
+static bool save_decoded_csv(const std::string &path) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    f << "type,time_utc,freq_hz,direction,summary,detail\n";
+    size_t n = 0;
+    auto row = [&](const char *type, uint64_t ts, double freq, int ul,
+                   const std::string &summary, const std::string &detail) {
+        f << type << ',' << utc_iso(ts) << ',' << (long long)freq << ','
+          << (ul ? "UL" : "DL") << ',' << csv_escape(summary) << ','
+          << csv_escape(detail) << '\n';
+        n++;
+    };
+
+    for (const auto &m : g_engine.acars().messages()) {
+        std::string detail = m.text;
+        if (!m.arinc622_text.empty()) detail += "\n" + m.arinc622_text;
+        row("ACARS", m.timestamp_ns, m.frequency, m.ul,
+            m.reg + " " + m.flight + " " + m.label, detail);
+    }
+    for (const auto &m : g_engine.acars().sbd_messages())
+        row("SBD", m.timestamp_ns, m.frequency, m.ul, m.info,
+            m.text.empty() ? m.payload_hex : m.text);
+    for (const auto &m : g_engine.acars().sms_messages())
+        row("SMS", m.timestamp_ns, m.frequency, m.ul,
+            m.from + " -> " + m.to, m.text);
+    for (const auto &m : g_engine.pager().messages())
+        row("PAGER", m.timestamp_ns, m.frequency, 0,
+            "RIC " + std::to_string(m.ric) + " fmt " + std::to_string(m.fmt), m.text);
+    for (const auto &m : g_engine.acars().l3_messages())
+        row("L3", m.timestamp_ns, m.frequency, m.ul,
+            m.proto + " " + m.type, m.summary);
+    for (const auto &m : g_engine.recent_messages(100000))
+        row(m.type.c_str(), m.timestamp_ns, m.frequency, m.uplink, m.pretty,
+            m.has_ida ? m.ida_text : "");
+
+    f.flush();
+    g_save_status = "Saved " + std::to_string(n) + " records to " + path;
+    return true;
 }
 
 void apply_spectrum_settings() {
@@ -698,7 +784,6 @@ void draw_menu_bar() {
             ImGui::MenuItem("Map", nullptr, &g_show_map);
             ImGui::MenuItem("Spectrum", nullptr, &g_show_spectrum);
             ImGui::MenuItem("Waterfall", nullptr, &g_show_waterfall);
-            ImGui::MenuItem("Stats", nullptr, &g_show_stats);
             ImGui::MenuItem("Bursts", nullptr, &g_show_bursts);
             ImGui::MenuItem("Messages", nullptr, &g_show_messages);
             ImGui::MenuItem("Satellites", nullptr, &g_show_sats);
@@ -711,7 +796,7 @@ void draw_menu_bar() {
             ImGui::MenuItem("Signaling", nullptr, &g_show_signaling);
             ImGui::MenuItem("Broadcast", nullptr, &g_show_broadcast);
             ImGui::MenuItem("ITL", nullptr, &g_show_itl);
-            ImGui::MenuItem("Source", nullptr, &g_show_source);
+            ImGui::MenuItem("Control", nullptr, &g_show_source);
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Help")) {
@@ -879,63 +964,54 @@ void draw_messages_window() {
     ImGui::End();
 }
 
-void draw_playback_window() {
-    ImGui::SetNextWindowSize(ImVec2(430, 0), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Playback")) {
-        bool running = g_engine.running();
-        if (!running) {
-            ImGui::BeginDisabled(!active_source()->is_open());
-            if (ImGui::Button("Start")) start_engine();
-            ImGui::EndDisabled();
-        } else {
-            if (ImGui::Button(g_engine.paused() ? "Resume" : "Pause")) g_engine.set_paused(!g_engine.paused());
-            ImGui::SameLine();
-            if (ImGui::Button("Stop")) g_engine.stop();
-        }
+void draw_playback_contents() {
+    bool running = g_engine.running();
+    if (!running) {
+        ImGui::BeginDisabled(!active_source()->is_open());
+        if (ImGui::Button("Start")) start_engine();
+        ImGui::EndDisabled();
+    } else {
+        if (ImGui::Button(g_engine.paused() ? "Resume" : "Pause")) g_engine.set_paused(!g_engine.paused());
         ImGui::SameLine();
-        bool rt = g_engine.realtime();
-        if (ImGui::Checkbox("1x realtime", &rt)) g_engine.set_realtime(rt);
-
-        iridi::EngineStats s = g_engine.stats();
-        char overlay[64];
-        if (s.total_samples) {
-            float frac = (float)((double)s.samples / (double)s.total_samples);
-            snprintf(overlay, sizeof(overlay), "%.1f%% (%.1f s)", frac * 100.0f, s.elapsed_s);
-            ImGui::ProgressBar(frac, ImVec2(-1, 0), overlay);
-        } else {
-            snprintf(overlay, sizeof(overlay), "live (%.1f s)", s.elapsed_s);
-            ImGui::ProgressBar(0.0f, ImVec2(-1, 0), overlay);
-        }
-        if (s.done) ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "Done");
+        if (ImGui::Button("Stop")) g_engine.stop();
     }
-    ImGui::End();
+    ImGui::SameLine();
+    bool rt = g_engine.realtime();
+    if (ImGui::Checkbox("1x realtime", &rt)) g_engine.set_realtime(rt);
+
+    iridi::EngineStats s = g_engine.stats();
+    char overlay[64];
+    if (s.total_samples) {
+        float frac = (float)((double)s.samples / (double)s.total_samples);
+        snprintf(overlay, sizeof(overlay), "%.1f%% (%.1f s)", frac * 100.0f, s.elapsed_s);
+        ImGui::ProgressBar(frac, ImVec2(-1, 0), overlay);
+    } else {
+        snprintf(overlay, sizeof(overlay), "live (%.1f s)", s.elapsed_s);
+        ImGui::ProgressBar(0.0f, ImVec2(-1, 0), overlay);
+    }
+    if (s.done) ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "Done");
 }
 
-void draw_stats_window() {
-    if (!g_show_stats) return;
-    ImGui::SetNextWindowSize(ImVec2(360, 220), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Stats", &g_show_stats)) {
-        iridi::EngineStats s = g_engine.stats();
-        if (ImGui::BeginTable("stats", 2, ImGuiTableFlags_SizingStretchProp)) {
-            auto row = [](const char *k, const char *v) {
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(k);
-                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(v);
-            };
-            char b[64];
-            snprintf(b, sizeof(b), "%llu", (unsigned long long)s.bursts);      row("Bursts tagged", b);
-            snprintf(b, sizeof(b), "%llu", (unsigned long long)s.frames_ok);   row("Frames demod", b);
-            snprintf(b, sizeof(b), "%llu", (unsigned long long)s.frames_fail); row("Frames failed", b);
-            snprintf(b, sizeof(b), "%llu", (unsigned long long)g_engine.parsed_count()); row("Parsed frames", b);
-            snprintf(b, sizeof(b), "%llu", (unsigned long long)g_engine.parse_error_count()); row("Parse errors", b);
-            snprintf(b, sizeof(b), "%zu", g_engine.satellites().size());       row("Satellites", b);
-            snprintf(b, sizeof(b), "%.1f s", s.elapsed_s);                     row("Elapsed", b);
-            snprintf(b, sizeof(b), "%s", s.running ? (s.paused ? "paused" : "running") : "stopped");
-            row("State", b);
-            ImGui::EndTable();
-        }
+void draw_stats_contents() {
+    iridi::EngineStats s = g_engine.stats();
+    if (ImGui::BeginTable("stats", 2, ImGuiTableFlags_SizingStretchProp)) {
+        auto row = [](const char *k, const char *v) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(k);
+            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(v);
+        };
+        char b[64];
+        snprintf(b, sizeof(b), "%llu", (unsigned long long)s.bursts);      row("Bursts tagged", b);
+        snprintf(b, sizeof(b), "%llu", (unsigned long long)s.frames_ok);   row("Frames demod", b);
+        snprintf(b, sizeof(b), "%llu", (unsigned long long)s.frames_fail); row("Frames failed", b);
+        snprintf(b, sizeof(b), "%llu", (unsigned long long)g_engine.parsed_count()); row("Parsed frames", b);
+        snprintf(b, sizeof(b), "%llu", (unsigned long long)g_engine.parse_error_count()); row("Parse errors", b);
+        snprintf(b, sizeof(b), "%zu", g_engine.satellites().size());       row("Satellites", b);
+        snprintf(b, sizeof(b), "%.1f s", s.elapsed_s);                     row("Elapsed", b);
+        snprintf(b, sizeof(b), "%s", s.running ? (s.paused ? "paused" : "running") : "stopped");
+        row("State", b);
+        ImGui::EndTable();
     }
-    ImGui::End();
 }
 
 void draw_spectrum_controls() {
@@ -2125,11 +2201,12 @@ void draw_rtlsdr_source_controls() {
 
 void draw_source_window() {
     if (!g_show_source) return;
-    ImGui::SetNextWindowSize(ImVec2(520, 300), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Source", &g_show_source)) {
+    ImGui::SetNextWindowSize(ImVec2(460, 680), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Control###Source", &g_show_source)) {
+        if (ImGui::CollapsingHeader("Input", ImGuiTreeNodeFlags_DefaultOpen)) {
         const char *kinds[] = {"IQ file", "SDRplay", "HackRF", "Airspy", "RTL-SDR"};
         ImGui::SetNextItemWidth(160);
-        if (ImGui::Combo("Source", &g_source_kind, kinds, 5)) {
+        if (ImGui::Combo("Type", &g_source_kind, kinds, 5)) {
             g_engine.stop();
             g_file.close();
             g_sdr.close();
@@ -2183,6 +2260,65 @@ void draw_source_window() {
         if (g_source_kind != 0) {
             ImGui::Separator();
             ImGui::Text("VFO: %.4f MHz", active_source()->center_frequency() / 1e6);
+        }
+        }
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("Playback", ImGuiTreeNodeFlags_DefaultOpen))
+            draw_playback_contents();
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("Stats", ImGuiTreeNodeFlags_DefaultOpen))
+            draw_stats_contents();
+
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("Wireshark output", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::Checkbox("Enable GSMTAP", &g_gsmtap_on)) {
+                if (g_gsmtap_on) {
+                    std::string err;
+                    if (!iridi::gsmtap_start(g_gsmtap_host, g_gsmtap_port, err)) {
+                        g_gsmtap_on = false;
+                        g_gsmtap_status = err;
+                        add_log("GSMTAP: %s", err.c_str());
+                    } else {
+                        g_gsmtap_status = "sending";
+                    }
+                } else {
+                    iridi::gsmtap_stop();
+                    g_gsmtap_status = "stopped";
+                }
+            }
+            ImGui::SetNextItemWidth(150);
+            ImGui::InputText("Host", g_gsmtap_host, sizeof(g_gsmtap_host));
+            ImGui::SetNextItemWidth(80);
+            if (ImGui::InputInt("Port", &g_gsmtap_port))
+                g_gsmtap_port = std::clamp(g_gsmtap_port, 1, 65535);
+            if (ImGui::Button("Apply")) {
+                if (g_gsmtap_on) {
+                    iridi::gsmtap_stop();
+                    std::string err;
+                    if (iridi::gsmtap_start(g_gsmtap_host, g_gsmtap_port, err)) {
+                        g_gsmtap_status = "sending";
+                    } else {
+                        g_gsmtap_on = false;
+                        g_gsmtap_status = err;
+                    }
+                }
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", g_gsmtap_status.c_str());
+            ImGui::TextDisabled("Wireshark: udp.port == %d  |  %llu packets",
+                                g_gsmtap_port,
+                                (unsigned long long)iridi::gsmtap_packets());
+        }
+
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("Data", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::Button("Save decoded data...")) {
+                std::string path = save_file_dialog();
+                if (!path.empty()) save_decoded_csv(path);
+            }
+            if (!g_save_status.empty())
+                ImGui::TextWrapped("%s", g_save_status.c_str());
+            ImGui::TextDisabled("CSV: ACARS, SBD, SMS, pager, L3 and parsed frames");
         }
     }
     ImGui::End();
@@ -2264,6 +2400,7 @@ void build_default_dock_layout(ImGuiID dockspace_id) {
     ImGui::DockBuilderDockWindow("Bursts", right);
     ImGui::DockBuilderDockWindow("Waterfall", bottom);
     ImGui::DockBuilderDockWindow("Messages", bottom);
+    ImGui::DockBuilderDockWindow("Bursts", bottom);
     ImGui::DockBuilderDockWindow("Voice", bottom);
     ImGui::DockBuilderDockWindow("ACARS", bottom);
     ImGui::DockBuilderDockWindow("Pager", bottom);
@@ -2272,8 +2409,6 @@ void build_default_dock_layout(ImGuiID dockspace_id) {
     ImGui::DockBuilderDockWindow("Signaling", bottom);
     ImGui::DockBuilderDockWindow("Broadcast", bottom);
     ImGui::DockBuilderDockWindow("ITL", bottom);
-    ImGui::DockBuilderDockWindow("Playback", left);
-    ImGui::DockBuilderDockWindow("Stats", left);
     ImGui::DockBuilderDockWindow("Satellites", left);
     ImGui::DockBuilderDockWindow("Paging", left);
     ImGui::DockBuilderDockWindow("Source", left);
@@ -2805,6 +2940,8 @@ int main(int argc, char **argv) {
         if (!grouped_msgs) {
             ImGuiWindow *msgw = ImGui::FindWindowByName("Messages");
             if (msgw && msgw->DockId) {
+                if (ImGuiWindow *w = ImGui::FindWindowByName("Bursts"))
+                    ImGui::SetWindowDock(w, msgw->DockId, ImGuiCond_Always);
                 if (ImGuiWindow *w = ImGui::FindWindowByName("Pager"))
                     ImGui::SetWindowDock(w, msgw->DockId, ImGuiCond_Always);
                 if (ImGuiWindow *w = ImGui::FindWindowByName("SMS"))
@@ -2843,8 +2980,6 @@ int main(int argc, char **argv) {
 
         draw_menu_bar();
         draw_map_window();
-        draw_playback_window();
-        draw_stats_window();
         draw_spectrum_window();
         draw_waterfall_window();
         draw_bursts_window();

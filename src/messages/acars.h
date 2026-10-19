@@ -16,6 +16,7 @@ namespace iridi {
 
 struct AcarsMessage {
     uint64_t timestamp_ns = 0;
+    double frequency = 0;
     int ul = 0;
     std::string heading;   // SBD preheader summary
     std::string reg;       // aircraft registration
@@ -43,6 +44,7 @@ struct AcarsMessage {
 // GSM 03.40 SMS recovered from IDA CP-DATA (protocol 0x09/0x89, type 0x01).
 struct SmsMessage {
     uint64_t timestamp_ns = 0;
+    double frequency = 0;
     int ul = 0;
     std::string from;   // SMS-DELIVER originator
     std::string to;     // SMS-SUBMIT destination
@@ -111,7 +113,8 @@ private:
                     const std::vector<uint8_t> &data, double time_s, int ul,
                     double frequency);
     void decode_acars(const std::vector<uint8_t> &data, double time_s, int ul,
-                      const std::vector<uint8_t> &prehdr, const std::string &typ);
+                      const std::vector<uint8_t> &prehdr, const std::string &typ,
+                      double frequency);
 
     mutable std::mutex mtx_;
     std::vector<SbdFrag> ida_buf_;

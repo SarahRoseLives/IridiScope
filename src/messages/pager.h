@@ -15,6 +15,7 @@ namespace iridi {
 
 struct PagerMessage {
     uint64_t timestamp_ns = 0;
+    double frequency = 0;
     int ric = 0;
     int fmt = 0;
     int seq = 0;
@@ -36,6 +37,7 @@ private:
     struct Entry {
         int ric = 0, fmt = 0, seq = 0;
         int parts = 1;
+        double frequency = 0;
         std::vector<char> have;
         std::vector<std::vector<uint8_t>> data; // fmt 5
         std::vector<std::string> text;          // fmt 3

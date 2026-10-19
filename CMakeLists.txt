@@ -222,6 +222,7 @@ set(APP_SOURCES
   src/messages/acars.cpp
   src/messages/pager.cpp
   src/messages/l3.cpp
+  src/output/gsmtap.cpp
   src/ui/waterfall.cpp
   src/util/iritime.cpp
   src/voice/voice_manager.cpp

@@ -1,5 +1,6 @@
 #include "messages/acars.h"
 #include "acars/libacars_bridge.h"
+#include "output/gsmtap.h"
 #include "parser/fec.h"
 #include "util/iritime.h"
 
@@ -260,12 +261,13 @@ std::vector<AcarsMessage> AcarsAssembler::messages() const {
 // ---- ACARS decode ----------------------------------------------------------
 void AcarsAssembler::decode_acars(const std::vector<uint8_t> &in, double time_s,
                                   int ul, const std::vector<uint8_t> &prehdr,
-                                  const std::string &typ) {
+                                  const std::string &typ, double frequency) {
     if (in.empty() || in[0] != 1) return;
     if (in.size() <= 2) return;
 
     AcarsMessage m;
     m.timestamp_ns = (uint64_t)(time_s * 1e9);
+    m.frequency = frequency;
     m.ul = ul;
     m.heading = typ + " <" + hexns(prehdr) + ">";
 
@@ -560,6 +562,8 @@ void AcarsAssembler::record_sbd(const std::string &typ, const std::vector<uint8_
 
 void AcarsAssembler::emit_sbd_payload(const std::vector<uint8_t> &pin, double time_s, int ul,
                                       double frequency) {
+    gsmtap_send(pin, ul, frequency);
+
     // Decode the reassembled Um/L3 payload as well.
     L3Message l3;
     if (decode_l3(pin, time_s, ul, frequency, l3)) {
@@ -580,6 +584,7 @@ void AcarsAssembler::emit_sbd_payload(const std::vector<uint8_t> &pin, double ti
         }
         SmsMessage m;
         m.timestamp_ns = (uint64_t)(time_s * 1e9);
+        m.frequency = frequency;
         m.ul = ul;
         if (decode_sms_tpdu(tpdu, m)) {
             sms_cnt_++;
@@ -650,11 +655,11 @@ void AcarsAssembler::emit_sbd_payload(const std::vector<uint8_t> &pin, double ti
 
     if (msgno == 0) {
         record_sbd(typ, prehdr, data, time_s, ul, frequency);
-        decode_acars(data, time_s, ul, prehdr, typ);
+        decode_acars(data, time_s, ul, prehdr, typ, frequency);
         return;
     } else if (msgcnt == 1 && msgno == 1) {
         record_sbd(typ, prehdr, data, time_s, ul, frequency);
-        decode_acars(data, time_s, ul, prehdr, typ);
+        decode_acars(data, time_s, ul, prehdr, typ, frequency);
         return;
     } else if (msgcnt > 1) {
         multi_.push_back({msgno, msgcnt, ul, time_s, data, typ, prehdr});
@@ -669,7 +674,7 @@ void AcarsAssembler::emit_sbd_payload(const std::vector<uint8_t> &pin, double ti
                     mp.msgno++;
                 } else {
                     record_sbd(mp.typ, mp.prehdr, mp.data, time_s, ul, frequency);
-                    decode_acars(mp.data, time_s, ul, mp.prehdr, mp.typ);
+                    decode_acars(mp.data, time_s, ul, mp.prehdr, mp.typ, frequency);
                     multi_.erase(multi_.begin() + i);
                 }
                 return;

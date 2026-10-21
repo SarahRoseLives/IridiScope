@@ -46,6 +46,8 @@ public:
     void set_ppm(double ppm);
     void set_bias_tee(bool on); // RSP/HackRF bias tee (powers an LNA)
     bool bias_tee() const { return bias_; }
+    void set_antenna(int port); // SDRplay multi-port antenna/input selection
+    int antenna() const { return antenna_; }
 
     // HackRF multi-stage gain.
     void set_lna_gain(int db);
@@ -81,6 +83,7 @@ private:
 
     mutable     std::unique_ptr<SdrSource> sdr_;
     SdrKind kind_ = SdrKind::Sdrplay;
+    std::string device_name_;
     std::atomic<bool> open_{false};
 
     double center_hz_ = 1623326935.0;
@@ -88,6 +91,7 @@ private:
     double gain_ = -1.0; // <0 => AGC
     double ppm_ = 0.0;
     bool bias_ = false;
+    int antenna_ = 0; // SDRplay multi-port antenna/input index
     int lna_ = 16; // HackRF IF gain (0..40, 8 dB steps)
     int vga_ = 16; // HackRF baseband gain (0..62, 2 dB steps)
     bool amp_ = false;

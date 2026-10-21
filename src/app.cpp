@@ -116,6 +116,7 @@ const char *kSdrplayRateLabels[] = {"2.0", "3.0", "4.0", "5.0", "6.0", "7.0", "8
 const int kNumSdrplayRates = (int)(sizeof(kSdrplayRates) / sizeof(kSdrplayRates[0]));
 int g_sdr_rate_idx = kNumSdrplayRates - 1; // 10 MHz
 int g_sdr_device_idx = 0;
+int g_sdr_antenna = 0;
 bool g_sdr_agc = true;
 float g_sdr_gr = 40.0f;
 bool g_sdr_bias = false;
@@ -665,13 +666,24 @@ void start_sdr() {
     g_source_kind = 1;
     g_sdr.set_gain(g_sdr_agc ? -1.0 : (double)g_sdr_gr);
     g_sdr.set_bias_tee(g_sdr_bias);
+    g_sdr.set_antenna(g_sdr_antenna);
     std::string err;
     if (!g_sdr.open(g_sdr_device_idx, g_vfo_hz, kSdrplayRates[g_sdr_rate_idx], err)) {
         add_log("ERROR: %s", err.c_str());
         return;
     }
-    add_log("SDRplay started: %s @ %.6f MHz, %.1f Msps", g_sdr.device_name().c_str(),
-            g_vfo_hz / 1e6, kSdrplayRates[g_sdr_rate_idx] / 1e6);
+    std::string port_label;
+    {
+        std::lock_guard<std::mutex> lk(g_sdr_dev_mtx);
+        if (g_sdr_device_idx >= 0 && g_sdr_device_idx < (int)g_sdr_devices.size()) {
+            const auto &ports = g_sdr_devices[g_sdr_device_idx].ports;
+            if (g_sdr_antenna >= 0 && g_sdr_antenna < (int)ports.size())
+                port_label = ports[g_sdr_antenna];
+        }
+    }
+    add_log("SDRplay started: %s @ %.6f MHz, %.1f Msps%s%s", g_sdr.device_name().c_str(),
+            g_vfo_hz / 1e6, kSdrplayRates[g_sdr_rate_idx] / 1e6,
+            port_label.empty() ? "" : ", port ", port_label.c_str());
     g_waterfall.clear();
     g_spec_seq = 0;
     g_freq_mhz.clear();
@@ -1912,6 +1924,13 @@ void draw_sdr_source_controls() {
     bool running = g_engine.running();
     const bool scanning = g_sdr_scanning.load();
 
+    const iridi::SdrDeviceInfo *selected = nullptr;
+    if (!devs.empty()) {
+        if (g_sdr_device_idx < 0 || g_sdr_device_idx >= (int)devs.size()) g_sdr_device_idx = 0;
+    } else {
+        g_sdr_device_idx = 0;
+    }
+
     if (scanning) {
         ImGui::TextDisabled("Scanning for SDRplay devices...");
     } else if (devs.empty()) {
@@ -1921,12 +1940,27 @@ void draw_sdr_source_controls() {
         names.reserve(devs.size());
         for (auto &d : devs) names.push_back(d.name.c_str());
         ImGui::SetNextItemWidth(200);
-        ImGui::Combo("Device", &g_sdr_device_idx, names.data(), (int)names.size());
+        if (ImGui::Combo("Device", &g_sdr_device_idx, names.data(), (int)names.size())) {
+            g_sdr_antenna = 0;
+        }
     }
     ImGui::SameLine();
     ImGui::BeginDisabled(scanning);
     if (ImGui::Button("Refresh")) request_sdr_device_scan();
     ImGui::EndDisabled();
+
+    selected = devs.empty() ? nullptr : &devs[g_sdr_device_idx];
+    if (selected && !selected->ports.empty()) {
+        if (g_sdr_antenna < 0 || g_sdr_antenna >= (int)selected->ports.size())
+            g_sdr_antenna = 0;
+        std::vector<const char *> ports;
+        ports.reserve(selected->ports.size());
+        for (auto &p : selected->ports) ports.push_back(p.c_str());
+        ImGui::SetNextItemWidth(200);
+        if (ImGui::Combo("Antenna port", &g_sdr_antenna, ports.data(), (int)ports.size())) {
+            if (g_sdr.is_open()) g_sdr.set_antenna(g_sdr_antenna);
+        }
+    }
 
     ImGui::SetNextItemWidth(200);
     if (ImGui::Combo("Sample rate (Msps)", &g_sdr_rate_idx, kSdrplayRateLabels, kNumSdrplayRates)) {
@@ -2480,6 +2514,30 @@ static void print_type_tally(iridi::Engine &eng) {
     printf("\nims=%zu msg_frames=%zu\n", ims, mframes);
 }
 
+static int pager_dump(const char *path, double seconds) {
+    iridi::IqFileSource src;
+    std::string err;
+    if (!src.open(path, err)) { fprintf(stderr, "%s\n", err.c_str()); return 2; }
+    iridi::Engine eng;
+    if (!eng.start(&src)) { fprintf(stderr, "engine start failed\n"); return 3; }
+    auto t0 = std::chrono::steady_clock::now();
+    while (true) {
+        auto s = eng.stats();
+        if (s.done) break;
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > seconds) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    auto msgs = eng.pager().messages();
+    printf("pager_messages=%zu\n", msgs.size());
+    for (const auto &m : msgs) {
+        printf("%.6f ric=%07d fmt=%d seq=%d parts=%d ok=%d freq=%.0f text=%s\n",
+               m.timestamp_ns / 1e9, m.ric, m.fmt, m.seq, m.parts, m.ok ? 1 : 0,
+               m.frequency, m.text.c_str());
+    }
+    eng.stop();
+    return 0;
+}
+
 static int scan_file(const char *path, double seconds) {
     iridi::IqFileSource src;
     std::string err;
@@ -2595,7 +2653,15 @@ static int sdr_list_devices() {
     if (!sdr.available()) { printf("SDRplay support not compiled in\n"); return 1; }
     auto devs = sdr.list_devices();
     printf("sdrplay_devices=%zu\n", devs.size());
-    for (auto &d : devs) printf("  [%d] %s  sn=%s\n", d.index, d.name.c_str(), d.serial.c_str());
+    for (auto &d : devs) {
+        printf("  [%d] %s  sn=%s", d.index, d.name.c_str(), d.serial.c_str());
+        if (!d.ports.empty()) {
+            printf("  ports=");
+            for (size_t i = 0; i < d.ports.size(); ++i)
+                printf("%s%s", i ? "|" : "", d.ports[i].c_str());
+        }
+        printf("\n");
+    }
     return 0;
 }
 
@@ -2817,7 +2883,8 @@ int main(int argc, char **argv) {
         if (a1 == "--info" || a1 == "--parse" || a1 == "--frame" || a1 == "--scan" ||
             a1 == "--sdr-list" || a1 == "--sdr-scan" || a1 == "--hrf-list" || a1 == "--hrf-scan" ||
             a1 == "--ap-list" || a1 == "--ap-scan" || a1 == "--rtl-list" || a1 == "--rtl-scan" ||
-            a1 == "--check-update" || a1 == "--lookup" || a1 == "--sms" || a1 == "--raw")
+            a1 == "--check-update" || a1 == "--lookup" || a1 == "--sms" || a1 == "--raw" ||
+            a1 == "--pager")
             attach_console();
     }
     if (argc >= 2 && std::string(argv[1]) == "--check-update") return check_update();
@@ -2846,6 +2913,8 @@ int main(int argc, char **argv) {
     if (argc >= 3 && std::string(argv[1]) == "--parse") return parse_raw_file(argv[2]);
     if (argc >= 3 && std::string(argv[1]) == "--frame") return parse_frames_debug(argv[2]);
     if (argc >= 3 && std::string(argv[1]) == "--scan") return scan_file(argv[2], argc >= 4 ? atof(argv[3]) : 12.0);
+    if (argc >= 3 && std::string(argv[1]) == "--pager")
+        return pager_dump(argv[2], argc >= 4 ? atof(argv[3]) : 60.0);
 
     if (!glfwInit()) { fprintf(stderr, "Failed to initialize GLFW\n"); return 1; }
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);

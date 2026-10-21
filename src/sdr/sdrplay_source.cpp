@@ -49,6 +49,33 @@ const char *hwName(unsigned char hwVer) {
     }
 }
 
+std::vector<std::string> portsForHw(unsigned char hwVer) {
+    switch (hwVer) {
+    case SDRPLAY_RSP2_ID:
+        return {"Port A", "Port B", "Hi-Z"};
+    case SDRPLAY_RSPduo_ID:
+        return {"Tuner 1 (50 ohm)", "Tuner 1 (Hi-Z)", "Tuner 2 (50 ohm)"};
+    case SDRPLAY_RSPdx_ID:
+    case SDRPLAY_RSPdxR2_ID:
+        return {"Port A", "Port B", "Port C"};
+    default:
+        return {};
+    }
+}
+
+// Map our UI port index to the API selector values. RSP2 uses antenna B plus
+// the AM port switch for Hi-Z; RSPduo uses tuner 1/2 and its AM port switch.
+const sdrplay_api_Rsp2_AntennaSelectT kRsp2Antenna[] = {
+    sdrplay_api_Rsp2_ANTENNA_A,
+    sdrplay_api_Rsp2_ANTENNA_B,
+    sdrplay_api_Rsp2_ANTENNA_B,
+};
+const sdrplay_api_RspDx_AntennaSelectT kRspDxAntenna[] = {
+    sdrplay_api_RspDx_ANTENNA_A,
+    sdrplay_api_RspDx_ANTENNA_B,
+    sdrplay_api_RspDx_ANTENNA_C,
+};
+
 sdrplay_api_Bw_MHzT bwForRate(double fsHz) {
     if (fsHz <= 0.25e6) return sdrplay_api_BW_0_200;
     if (fsHz <= 0.30e6) return sdrplay_api_BW_0_300;
@@ -86,6 +113,7 @@ std::vector<SdrDeviceInfo> SdrplaySource::listDevices() {
             info.index = (int)out.size();
             info.name = hwName(devs[i].hwVer);
             info.serial = devs[i].SerNo;
+            info.ports = portsForHw(devs[i].hwVer);
             out.push_back(info);
         }
     }
@@ -145,7 +173,11 @@ bool SdrplaySource::acquire(int deviceIndex, SdrSampleCb cb, std::string &err) {
 
     dev_ = new sdrplay_api_DeviceT(*pick);
     hwVer_ = pick->hwVer;
+    int maxPorts = portCount();
+    if (maxPorts > 0) antenna_ = std::clamp(antenna_, 0, maxPorts - 1);
+    else antenna_ = 0;
     dev_->tuner = sdrplay_api_Tuner_A;
+    dev_->rspDuoMode = sdrplay_api_RspDuoMode_Single_Tuner;
     sdrplay_api_DisableHeartbeat();
     r = sdrplay_api_SelectDevice(dev_);
     sdrplay_api_UnlockDeviceApi();
@@ -166,16 +198,27 @@ bool SdrplaySource::acquire(int deviceIndex, SdrSampleCb cb, std::string &err) {
         return false;
     }
 
+    activeTuner_ = dev_->tuner;
+    rx_ = (activeTuner_ == sdrplay_api_Tuner_B) ? params_->rxChannelB : params_->rxChannelA;
+    if (!rx_) {
+        sdrplay_api_ReleaseDevice(dev_);
+        delete dev_;
+        dev_ = nullptr;
+        params_ = nullptr;
+        err = "SDRplay selected tuner is unavailable";
+        return false;
+    }
+
     params_->devParams->fsFreq.fsHz = sampleRate_;
     params_->devParams->ppm = ppm_;
-    params_->rxChannelA->tunerParams.rfFreq.rfHz = centerFreq_;
-    params_->rxChannelA->tunerParams.bwType = bwForRate(sampleRate_);
-    params_->rxChannelA->tunerParams.ifType = sdrplay_api_IF_Zero;
-    params_->rxChannelA->ctrlParams.decimation.enable = 0;
-    params_->rxChannelA->ctrlParams.decimation.decimationFactor = 1;
-    params_->rxChannelA->ctrlParams.dcOffset.DCenable = 1;
-    params_->rxChannelA->ctrlParams.dcOffset.IQenable = 1;
-    params_->rxChannelA->rsp1aTunerParams.biasTEnable = biasTee_ ? 1 : 0;
+    rx_->tunerParams.rfFreq.rfHz = centerFreq_;
+    rx_->tunerParams.bwType = bwForRate(sampleRate_);
+    rx_->tunerParams.ifType = sdrplay_api_IF_Zero;
+    rx_->ctrlParams.decimation.enable = 0;
+    rx_->ctrlParams.decimation.decimationFactor = 1;
+    rx_->ctrlParams.dcOffset.DCenable = 1;
+    rx_->ctrlParams.dcOffset.IQenable = 1;
+    applyDeviceParams();
     applyGain();
 
     sdrplay_api_CallbackFnsT fns{};
@@ -192,10 +235,13 @@ bool SdrplaySource::acquire(int deviceIndex, SdrSampleCb cb, std::string &err) {
         delete dev_;
         dev_ = nullptr;
         params_ = nullptr;
+        rx_ = nullptr;
+        activeTuner_ = sdrplay_api_Tuner_A;
         err = "SDRplay Init failed: " + std::string(sdrplay_api_GetErrorString(r));
         return false;
     }
     cb_ = std::move(cb);
+    applyAntenna();
     return true;
 }
 
@@ -207,6 +253,8 @@ void SdrplaySource::stop() {
         delete dev_;
         dev_ = nullptr;
         params_ = nullptr;
+        rx_ = nullptr;
+        activeTuner_ = sdrplay_api_Tuner_A;
     }
     running_.store(false);
     cb_ = nullptr;
@@ -236,14 +284,114 @@ void SdrplaySource::handleRx(const short *xi, const short *xq, int n) {
     cb_(out, n);
 }
 
+int SdrplaySource::portCount() const {
+    return (int)portsForHw(hwVer_).size();
+}
+
+void SdrplaySource::applyDeviceParams() {
+    if (!rx_ || !params_) return;
+    int p = std::clamp(antenna_, 0, 2);
+    switch (hwVer_) {
+    case SDRPLAY_RSP1A_ID:
+    case SDRPLAY_RSP1B_ID:
+        rx_->rsp1aTunerParams.biasTEnable = biasTee_ ? 1 : 0;
+        break;
+    case SDRPLAY_RSP2_ID:
+        rx_->rsp2TunerParams.biasTEnable = biasTee_ ? 1 : 0;
+        rx_->rsp2TunerParams.antennaSel = kRsp2Antenna[p];
+        rx_->rsp2TunerParams.amPortSel = (p == 2) ? sdrplay_api_Rsp2_AMPORT_1
+                                                  : sdrplay_api_Rsp2_AMPORT_2;
+        break;
+    case SDRPLAY_RSPduo_ID:
+        rx_->rspDuoTunerParams.biasTEnable = biasTee_ ? 1 : 0;
+        rx_->rspDuoTunerParams.tuner1AmPortSel =
+            (p == 0) ? sdrplay_api_RspDuo_AMPORT_2 : sdrplay_api_RspDuo_AMPORT_1;
+        break;
+    case SDRPLAY_RSPdx_ID:
+    case SDRPLAY_RSPdxR2_ID:
+        params_->devParams->rspDxParams.biasTEnable = biasTee_ ? 1 : 0;
+        params_->devParams->rspDxParams.antennaSel = kRspDxAntenna[p];
+        break;
+    default:
+        break;
+    }
+}
+
+void SdrplaySource::applyAntenna() {
+    if (!dev_ || !params_ || !rx_) return;
+    int n = portCount();
+    if (n <= 0) return;
+    antenna_ = std::clamp(antenna_, 0, n - 1);
+
+    if (hwVer_ == SDRPLAY_RSPduo_ID) {
+        sdrplay_api_TunerSelectT want = (antenna_ == 2) ? sdrplay_api_Tuner_B
+                                                        : sdrplay_api_Tuner_A;
+        auto am = (antenna_ == 0) ? sdrplay_api_RspDuo_AMPORT_2
+                                  : sdrplay_api_RspDuo_AMPORT_1;
+        std::lock_guard<std::mutex> lk(g_apiMtx);
+        if (want != activeTuner_) {
+            sdrplay_api_TunerSelectT t = activeTuner_;
+            sdrplay_api_ErrT r = sdrplay_api_SwapRspDuoActiveTuner(dev_->dev, &t, am);
+            if (r != sdrplay_api_Success) {
+                std::fprintf(stderr, "[sdrplay] SwapRspDuoActiveTuner failed: %s\n",
+                             sdrplay_api_GetErrorString(r));
+                return;
+            }
+            dev_->tuner = t;
+            activeTuner_ = t;
+            rx_ = (t == sdrplay_api_Tuner_B) ? params_->rxChannelB : params_->rxChannelA;
+            if (!rx_) return;
+            rx_->tunerParams.rfFreq.rfHz = centerFreq_ * (1.0 + ppm_ / 1e6);
+            rx_->tunerParams.bwType = bwForRate(sampleRate_);
+            rx_->tunerParams.ifType = sdrplay_api_IF_Zero;
+            rx_->ctrlParams.decimation.enable = 0;
+            rx_->ctrlParams.decimation.decimationFactor = 1;
+            rx_->ctrlParams.dcOffset.DCenable = 1;
+            rx_->ctrlParams.dcOffset.IQenable = 1;
+            applyGain();
+            applyDeviceParams();
+            sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Tuner_Frf,
+                               sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Tuner_BwType,
+                               sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Tuner_IfType,
+                               sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Ctrl_Decimation,
+                               sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Ctrl_DCoffsetIQimbalance,
+                               sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Tuner_Gr,
+                               sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Ctrl_Agc,
+                               sdrplay_api_Update_Ext1_None);
+        }
+        applyDeviceParams();
+        sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_RspDuo_AmPortSelect,
+                           sdrplay_api_Update_Ext1_None);
+        return;
+    }
+
+    applyDeviceParams();
+    std::lock_guard<std::mutex> lk(g_apiMtx);
+    if (hwVer_ == SDRPLAY_RSP2_ID) {
+        sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Rsp2_AntennaControl,
+                           sdrplay_api_Update_Ext1_None);
+        sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Rsp2_AmPortSelect,
+                           sdrplay_api_Update_Ext1_None);
+    } else if (hwVer_ == SDRPLAY_RSPdx_ID || hwVer_ == SDRPLAY_RSPdxR2_ID) {
+        sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_None,
+                           sdrplay_api_Update_RspDx_AntennaControl);
+    }
+}
+
 void SdrplaySource::applyGain() {
-    if (!params_) return;
-    sdrplay_api_GainT &g = params_->rxChannelA->tunerParams.gain;
+    if (!rx_) return;
+    sdrplay_api_GainT &g = rx_->tunerParams.gain;
     if (gainDb_ < 0.0) {
-        params_->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ;
-        params_->rxChannelA->ctrlParams.agc.setPoint_dBfs = -30;
+        rx_->ctrlParams.agc.enable = sdrplay_api_AGC_50HZ;
+        rx_->ctrlParams.agc.setPoint_dBfs = -30;
     } else {
-        params_->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_DISABLE;
+        rx_->ctrlParams.agc.enable = sdrplay_api_AGC_DISABLE;
         // More gain => lower reduction. gRdB valid range ~20..59.
         int gr = (int)std::lround(59.0 - gainDb_);
         g.gRdB = std::clamp(gr, (int)sdrplay_api_NORMAL_MIN_GR, 59);
@@ -252,14 +400,14 @@ void SdrplaySource::applyGain() {
 }
 
 void SdrplaySource::applyTune() {
-    if (!params_) return;
-    params_->rxChannelA->tunerParams.rfFreq.rfHz = centerFreq_ * (1.0 + ppm_ / 1e6);
+    if (!rx_ || !dev_ || !params_) return;
+    rx_->tunerParams.rfFreq.rfHz = centerFreq_ * (1.0 + ppm_ / 1e6);
     std::lock_guard<std::mutex> lk(g_apiMtx);
-    sdrplay_api_Update(dev_->dev, sdrplay_api_Tuner_A,
+    sdrplay_api_Update(dev_->dev, activeTuner_,
                        sdrplay_api_Update_Tuner_Frf, sdrplay_api_Update_Ext1_None);
     if (ppm_ != 0.0) {
         params_->devParams->ppm = ppm_;
-        sdrplay_api_Update(dev_->dev, sdrplay_api_Tuner_A,
+        sdrplay_api_Update(dev_->dev, activeTuner_,
                            sdrplay_api_Update_Dev_Ppm, sdrplay_api_Update_Ext1_None);
     }
 }
@@ -276,34 +424,60 @@ void SdrplaySource::setPpm(double ppm) {
 
 void SdrplaySource::setSampleRate(double hz) {
     sampleRate_ = hz;
-    if (!running_.load() || !params_) return;
+    if (!running_.load() || !params_ || !rx_) return;
     params_->devParams->fsFreq.fsHz = hz;
-    params_->rxChannelA->tunerParams.bwType = bwForRate(hz);
+    rx_->tunerParams.bwType = bwForRate(hz);
     std::lock_guard<std::mutex> lk(g_apiMtx);
-    sdrplay_api_Update(dev_->dev, sdrplay_api_Tuner_A,
+    sdrplay_api_Update(dev_->dev, activeTuner_,
                        sdrplay_api_Update_Dev_Fs, sdrplay_api_Update_Ext1_None);
-    sdrplay_api_Update(dev_->dev, sdrplay_api_Tuner_A,
+    sdrplay_api_Update(dev_->dev, activeTuner_,
                        sdrplay_api_Update_Tuner_BwType, sdrplay_api_Update_Ext1_None);
 }
 
 void SdrplaySource::setGain(double db) {
     gainDb_ = db;
-    if (!running_.load() || !params_) return;
+    if (!running_.load() || !params_ || !rx_) return;
     applyGain();
     std::lock_guard<std::mutex> lk(g_apiMtx);
-    sdrplay_api_Update(dev_->dev, sdrplay_api_Tuner_A,
+    sdrplay_api_Update(dev_->dev, activeTuner_,
                        sdrplay_api_Update_Tuner_Gr, sdrplay_api_Update_Ext1_None);
-    sdrplay_api_Update(dev_->dev, sdrplay_api_Tuner_A,
+    sdrplay_api_Update(dev_->dev, activeTuner_,
                        sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_Ext1_None);
 }
 
 void SdrplaySource::setBiasTee(bool on) {
     biasTee_ = on;
-    if (!running_.load() || !params_) return;
-    params_->rxChannelA->rsp1aTunerParams.biasTEnable = on ? 1 : 0;
+    if (!running_.load() || !params_ || !rx_) return;
+    applyDeviceParams();
     std::lock_guard<std::mutex> lk(g_apiMtx);
-    sdrplay_api_Update(dev_->dev, sdrplay_api_Tuner_A,
-                       sdrplay_api_Update_Rsp1a_BiasTControl, sdrplay_api_Update_Ext1_None);
+    switch (hwVer_) {
+    case SDRPLAY_RSP1A_ID:
+    case SDRPLAY_RSP1B_ID:
+        sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Rsp1a_BiasTControl,
+                           sdrplay_api_Update_Ext1_None);
+        break;
+    case SDRPLAY_RSP2_ID:
+        sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Rsp2_BiasTControl,
+                           sdrplay_api_Update_Ext1_None);
+        break;
+    case SDRPLAY_RSPduo_ID:
+        sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_RspDuo_BiasTControl,
+                           sdrplay_api_Update_Ext1_None);
+        break;
+    case SDRPLAY_RSPdx_ID:
+    case SDRPLAY_RSPdxR2_ID:
+        sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_None,
+                           sdrplay_api_Update_RspDx_BiasTControl);
+        break;
+    default:
+        break;
+    }
+}
+
+void SdrplaySource::setAntenna(int port) {
+    antenna_ = port;
+    if (!running_.load() || !dev_ || !params_ || !rx_) return;
+    applyAntenna();
 }
 
 std::unique_ptr<SdrSource> make_sdrplay_source() {

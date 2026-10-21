@@ -47,10 +47,21 @@ bool LiveIqSource::open(int device_index, double center_hz, double sample_rate_h
                         std::string &err) {
     close();
     err.clear();
+    device_name_.clear();
 
     if (!ensure_backend()) {
-        err = "SDRplay support is not compiled in (API not found at build time)";
+        err = "SDR backend is not compiled in";
         return false;
+    }
+
+    // Cache the selected device name before start(): some backends no longer
+    // enumerate the device once it is open (notably libairspy).
+    {
+        auto devs = sdr_->listDevices();
+        if (!devs.empty()) {
+            int idx = (device_index >= 0 && device_index < (int)devs.size()) ? device_index : 0;
+            device_name_ = devs[idx].name;
+        }
     }
 
     center_hz_ = center_hz;
@@ -60,6 +71,7 @@ bool LiveIqSource::open(int device_index, double center_hz, double sample_rate_h
     sdr_->setGain(gain_);
     sdr_->setPpm(ppm_);
     sdr_->setBiasTee(bias_);
+    sdr_->setAntenna(antenna_);
     sdr_->setLnaGain(lna_);
     sdr_->setVgaGain(vga_);
     sdr_->setAmp(amp_);
@@ -129,6 +141,11 @@ void LiveIqSource::set_bias_tee(bool on) {
     if (sdr_) sdr_->setBiasTee(on);
 }
 
+void LiveIqSource::set_antenna(int port) {
+    antenna_ = port;
+    if (sdr_) sdr_->setAntenna(port);
+}
+
 void LiveIqSource::set_lna_gain(int db) {
     lna_ = db;
     if (sdr_) sdr_->setLnaGain(db);
@@ -182,10 +199,14 @@ std::vector<SdrDeviceInfo> LiveIqSource::list_devices() const {
 }
 
 std::string LiveIqSource::device_name() const {
-    if (!ensure_backend()) return "SDRplay";
-    auto devs = sdr_->listDevices();
-    if (devs.empty()) return "SDRplay";
-    return devs.front().name;
+    if (!device_name_.empty()) return device_name_;
+    switch (kind_) {
+    case SdrKind::Airspy: return "Airspy";
+    case SdrKind::HackRF: return "HackRF";
+    case SdrKind::RTL:    return "RTL-SDR";
+    case SdrKind::Sdrplay:
+    default:              return "SDRplay";
+    }
 }
 
 void LiveIqSource::on_samples(const float *iq, int n) {

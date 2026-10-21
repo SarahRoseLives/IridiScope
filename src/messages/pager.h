@@ -44,6 +44,7 @@ private:
         int checksum = 0;
         double time = 0;
         uint64_t timestamp_ns = 0;
+        bool sent = false;
     };
 
     void emit(Entry &e);

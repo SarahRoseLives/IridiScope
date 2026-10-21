@@ -1,5 +1,6 @@
 // SDRplay source backend using the SDRplay API (v3.x).
-// Supports RSP1A / RSP1B / RSP2 / RSPduo / RSPdx single-tuner receive.
+// Supports RSP1A / RSP1B / RSP2 / RSPduo / RSPdx single-tuner receive,
+// including antenna/input port selection on the multi-port models.
 // Adapted from AirScope's src/sdr/sdrplay_source.{h,cpp}.
 #ifndef IRIDISCOPE_SDRPLAY_SOURCE_H
 #define IRIDISCOPE_SDRPLAY_SOURCE_H
@@ -28,6 +29,7 @@ public:
     void setGain(double db) override; // <0 => AGC
     void setBiasTee(bool on) override;
     void setPpm(double ppm) override;
+    void setAntenna(int port) override;
 
     double centerFreq() const override { return centerFreq_; }
     double sampleRate() const override { return sampleRate_; }
@@ -42,11 +44,15 @@ public:
 private:
     void applyGain();
     void applyTune();
+    void applyAntenna();
+    void applyDeviceParams();
     // One attempt to select the device and start streaming.
     bool acquire(int deviceIndex, SdrSampleCb cb, std::string &err);
+    int portCount() const;
 
     sdrplay_api_DeviceT *dev_ = nullptr;
     sdrplay_api_DeviceParamsT *params_ = nullptr;
+    sdrplay_api_RxChannelParamsT *rx_ = nullptr;
 
     std::atomic<bool> running_{false};
     SdrSampleCb cb_;
@@ -56,6 +62,8 @@ private:
     double gainDb_ = -1.0; // <0 => AGC
     double ppm_ = 0.0;
     bool biasTee_ = false;
+    int antenna_ = 0;
+    sdrplay_api_TunerSelectT activeTuner_ = sdrplay_api_Tuner_A;
 
     float dcOffRe_ = 0.0f, dcOffIm_ = 0.0f;
     float dcRate_ = 2.0e-5f;

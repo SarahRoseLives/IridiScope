@@ -17,6 +17,9 @@ struct SdrDeviceInfo {
     int index = 0;
     std::string name;
     std::string serial;
+    // Selectable antenna/input ports, in backend order. Empty when the device
+    // has a single fixed input (RSP1/RSP1A/RSP1B, HackRF, Airspy, RTL-SDR).
+    std::vector<std::string> ports;
 };
 
 // Which SDR backend a LiveIqSource should use.
@@ -38,6 +41,9 @@ public:
     virtual void setGain(double db) = 0; // <0 => auto/AGC
     virtual void setBiasTee(bool on) = 0;
     virtual void setPpm(double ppm) = 0;
+    // Selectable antenna/input port for multi-port devices (SDRplay RSP2,
+    // RSPduo, RSPdx). No-op on backends without selectable ports.
+    virtual void setAntenna(int port) { (void)port; }
 
     // Multi-stage gain (HackRF / Airspy). No-ops on backends without them.
     virtual void setLnaGain(int) {}

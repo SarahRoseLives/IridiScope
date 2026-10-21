@@ -128,8 +128,10 @@ void PagerAssembler::feed(const irid::ParsedMessage &pm) {
         if (!h) { complete = false; break; }
 
     if (complete) {
-        emit(e);
-        buf_.erase(buf_.begin() + idx);
+        // Keep the completed entry around so retransmissions of the same
+        // message (often on several simplex channels) are not emitted again.
+        if (!e.sent) emit(e);
+        e.sent = true;
     }
 
     expire(t);

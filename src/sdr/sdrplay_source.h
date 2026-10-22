@@ -44,7 +44,6 @@ public:
 private:
     void applyGain();
     void applyTune();
-    void applyAntenna();
     void applyDeviceParams();
     // One attempt to select the device and start streaming.
     bool acquire(int deviceIndex, SdrSampleCb cb, std::string &err);
@@ -57,7 +56,7 @@ private:
     std::atomic<bool> running_{false};
     SdrSampleCb cb_;
 
-    double centerFreq_ = 1623326935.0;
+    double centerFreq_ = 1621250000.0;
     double sampleRate_ = 8.0e6;
     double gainDb_ = -1.0; // <0 => AGC
     double ppm_ = 0.0;

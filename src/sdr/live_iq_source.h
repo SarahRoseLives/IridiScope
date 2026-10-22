@@ -19,7 +19,7 @@ namespace iridi {
 class LiveIqSource : public IqSource {
 public:
     // center_hz / sample_rate_hz seed the backend defaults.
-    LiveIqSource(SdrKind kind = SdrKind::Sdrplay, double center_hz = 1623326935.0,
+    LiveIqSource(SdrKind kind = SdrKind::Sdrplay, double center_hz = 1621250000.0,
                  double sample_rate_hz = 8.0e6);
     ~LiveIqSource() override;
 
@@ -86,7 +86,7 @@ private:
     std::string device_name_;
     std::atomic<bool> open_{false};
 
-    double center_hz_ = 1623326935.0;
+    double center_hz_ = 1621250000.0;
     double sample_rate_ = 8.0e6;
     double gain_ = -1.0; // <0 => AGC
     double ppm_ = 0.0;

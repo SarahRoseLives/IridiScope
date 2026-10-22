@@ -176,8 +176,11 @@ bool SdrplaySource::acquire(int deviceIndex, SdrSampleCb cb, std::string &err) {
     int maxPorts = portCount();
     if (maxPorts > 0) antenna_ = std::clamp(antenna_, 0, maxPorts - 1);
     else antenna_ = 0;
-    dev_->tuner = sdrplay_api_Tuner_A;
-    dev_->rspDuoMode = sdrplay_api_RspDuoMode_Single_Tuner;
+    dev_->tuner = (hwVer_ == SDRPLAY_RSPduo_ID && antenna_ == 2)
+                      ? sdrplay_api_Tuner_B
+                      : sdrplay_api_Tuner_A;
+    if (hwVer_ == SDRPLAY_RSPduo_ID)
+        dev_->rspDuoMode = sdrplay_api_RspDuoMode_Single_Tuner;
     sdrplay_api_DisableHeartbeat();
     r = sdrplay_api_SelectDevice(dev_);
     sdrplay_api_UnlockDeviceApi();
@@ -223,7 +226,7 @@ bool SdrplaySource::acquire(int deviceIndex, SdrSampleCb cb, std::string &err) {
 
     sdrplay_api_CallbackFnsT fns{};
     fns.StreamACbFn = &streamACb;
-    fns.StreamBCbFn = nullptr;
+    fns.StreamBCbFn = &streamACb; // RSPduo tuner 2 uses the B callback
     fns.EventCbFn = &eventCb;
 
     dcOffRe_ = dcOffIm_ = 0.0f;
@@ -241,7 +244,6 @@ bool SdrplaySource::acquire(int deviceIndex, SdrSampleCb cb, std::string &err) {
         return false;
     }
     cb_ = std::move(cb);
-    applyAntenna();
     return true;
 }
 
@@ -291,96 +293,39 @@ int SdrplaySource::portCount() const {
 void SdrplaySource::applyDeviceParams() {
     if (!rx_ || !params_) return;
     int p = std::clamp(antenna_, 0, 2);
+
+    // Do not write default-valued fields at start-up. Some RSPdx/RSPduo API
+    // builds are sensitive to post-Init updates; leaving defaults untouched
+    // keeps the normal (port A / tuner 1) path identical to RSP1A/RSP1B.
+    auto setBias = [&](unsigned char &field) {
+        if (biasTee_ || running_.load()) field = biasTee_ ? 1 : 0;
+    };
+
     switch (hwVer_) {
     case SDRPLAY_RSP1A_ID:
     case SDRPLAY_RSP1B_ID:
-        rx_->rsp1aTunerParams.biasTEnable = biasTee_ ? 1 : 0;
+        setBias(rx_->rsp1aTunerParams.biasTEnable);
         break;
     case SDRPLAY_RSP2_ID:
-        rx_->rsp2TunerParams.biasTEnable = biasTee_ ? 1 : 0;
-        rx_->rsp2TunerParams.antennaSel = kRsp2Antenna[p];
-        rx_->rsp2TunerParams.amPortSel = (p == 2) ? sdrplay_api_Rsp2_AMPORT_1
-                                                  : sdrplay_api_Rsp2_AMPORT_2;
+        setBias(rx_->rsp2TunerParams.biasTEnable);
+        if (p != 0) {
+            rx_->rsp2TunerParams.antennaSel = kRsp2Antenna[p];
+            rx_->rsp2TunerParams.amPortSel = (p == 2) ? sdrplay_api_Rsp2_AMPORT_1
+                                                      : sdrplay_api_Rsp2_AMPORT_2;
+        }
         break;
     case SDRPLAY_RSPduo_ID:
-        rx_->rspDuoTunerParams.biasTEnable = biasTee_ ? 1 : 0;
-        rx_->rspDuoTunerParams.tuner1AmPortSel =
-            (p == 0) ? sdrplay_api_RspDuo_AMPORT_2 : sdrplay_api_RspDuo_AMPORT_1;
+        setBias(rx_->rspDuoTunerParams.biasTEnable);
+        if (p == 1)
+            rx_->rspDuoTunerParams.tuner1AmPortSel = sdrplay_api_RspDuo_AMPORT_1;
         break;
     case SDRPLAY_RSPdx_ID:
     case SDRPLAY_RSPdxR2_ID:
-        params_->devParams->rspDxParams.biasTEnable = biasTee_ ? 1 : 0;
-        params_->devParams->rspDxParams.antennaSel = kRspDxAntenna[p];
+        setBias(params_->devParams->rspDxParams.biasTEnable);
+        if (p != 0) params_->devParams->rspDxParams.antennaSel = kRspDxAntenna[p];
         break;
     default:
         break;
-    }
-}
-
-void SdrplaySource::applyAntenna() {
-    if (!dev_ || !params_ || !rx_) return;
-    int n = portCount();
-    if (n <= 0) return;
-    antenna_ = std::clamp(antenna_, 0, n - 1);
-
-    if (hwVer_ == SDRPLAY_RSPduo_ID) {
-        sdrplay_api_TunerSelectT want = (antenna_ == 2) ? sdrplay_api_Tuner_B
-                                                        : sdrplay_api_Tuner_A;
-        auto am = (antenna_ == 0) ? sdrplay_api_RspDuo_AMPORT_2
-                                  : sdrplay_api_RspDuo_AMPORT_1;
-        std::lock_guard<std::mutex> lk(g_apiMtx);
-        if (want != activeTuner_) {
-            sdrplay_api_TunerSelectT t = activeTuner_;
-            sdrplay_api_ErrT r = sdrplay_api_SwapRspDuoActiveTuner(dev_->dev, &t, am);
-            if (r != sdrplay_api_Success) {
-                std::fprintf(stderr, "[sdrplay] SwapRspDuoActiveTuner failed: %s\n",
-                             sdrplay_api_GetErrorString(r));
-                return;
-            }
-            dev_->tuner = t;
-            activeTuner_ = t;
-            rx_ = (t == sdrplay_api_Tuner_B) ? params_->rxChannelB : params_->rxChannelA;
-            if (!rx_) return;
-            rx_->tunerParams.rfFreq.rfHz = centerFreq_ * (1.0 + ppm_ / 1e6);
-            rx_->tunerParams.bwType = bwForRate(sampleRate_);
-            rx_->tunerParams.ifType = sdrplay_api_IF_Zero;
-            rx_->ctrlParams.decimation.enable = 0;
-            rx_->ctrlParams.decimation.decimationFactor = 1;
-            rx_->ctrlParams.dcOffset.DCenable = 1;
-            rx_->ctrlParams.dcOffset.IQenable = 1;
-            applyGain();
-            applyDeviceParams();
-            sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Tuner_Frf,
-                               sdrplay_api_Update_Ext1_None);
-            sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Tuner_BwType,
-                               sdrplay_api_Update_Ext1_None);
-            sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Tuner_IfType,
-                               sdrplay_api_Update_Ext1_None);
-            sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Ctrl_Decimation,
-                               sdrplay_api_Update_Ext1_None);
-            sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Ctrl_DCoffsetIQimbalance,
-                               sdrplay_api_Update_Ext1_None);
-            sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Tuner_Gr,
-                               sdrplay_api_Update_Ext1_None);
-            sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Ctrl_Agc,
-                               sdrplay_api_Update_Ext1_None);
-        }
-        applyDeviceParams();
-        sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_RspDuo_AmPortSelect,
-                           sdrplay_api_Update_Ext1_None);
-        return;
-    }
-
-    applyDeviceParams();
-    std::lock_guard<std::mutex> lk(g_apiMtx);
-    if (hwVer_ == SDRPLAY_RSP2_ID) {
-        sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Rsp2_AntennaControl,
-                           sdrplay_api_Update_Ext1_None);
-        sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_Rsp2_AmPortSelect,
-                           sdrplay_api_Update_Ext1_None);
-    } else if (hwVer_ == SDRPLAY_RSPdx_ID || hwVer_ == SDRPLAY_RSPdxR2_ID) {
-        sdrplay_api_Update(dev_->dev, activeTuner_, sdrplay_api_Update_None,
-                           sdrplay_api_Update_RspDx_AntennaControl);
     }
 }
 
@@ -475,9 +420,9 @@ void SdrplaySource::setBiasTee(bool on) {
 }
 
 void SdrplaySource::setAntenna(int port) {
+    // Applied on the next start. The UI restarts the stream when the port
+    // changes, which avoids fragile live antenna updates on RSPdx/RSPduo.
     antenna_ = port;
-    if (!running_.load() || !dev_ || !params_ || !rx_) return;
-    applyAntenna();
 }
 
 std::unique_ptr<SdrSource> make_sdrplay_source() {

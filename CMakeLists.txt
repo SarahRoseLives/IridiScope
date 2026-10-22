@@ -250,7 +250,7 @@ target_include_directories(IridiScope PRIVATE
 target_compile_definitions(IridiScope PRIVATE
   IRIDISCOPE_ASSETS="${CMAKE_SOURCE_DIR}/assets"
   IRIDISCOPE_VERSION_MAJOR=0
-  IRIDISCOPE_VERSION_MINOR=3
+  IRIDISCOPE_VERSION_MINOR=5
 )
 
 # Also place the assets next to the executable so users can override the map

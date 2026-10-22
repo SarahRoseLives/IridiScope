@@ -106,8 +106,13 @@ iridi::IqSource *active_source() {
     return (iridi::IqSource *)&g_file;
 }
 
-// Default VFO: center of the Iridium band. The VFO can be moved 1616-1626.5 MHz.
-const double kDefaultVfoHz = 1621250000.0;
+// Iridium band limits, used for the band plan and as the default tuning range.
+const double kBandLoMhz = 1616.0;
+const double kBandHiMhz = 1626.5;
+
+// Default VFO: center of the Iridium band. The VFO itself is not band-limited;
+// live SDRs can be tuned anywhere their hardware supports.
+const double kDefaultVfoHz = (kBandLoMhz + kBandHiMhz) * 0.5 * 1e6;
 double g_vfo_hz = kDefaultVfoHz;
 
 // SDRplay sample rates.
@@ -516,12 +521,9 @@ void start_engine() {
     else add_log("ERROR: failed to start engine");
 }
 
-const double kBandLoMhz = 1616.0;
-const double kBandHiMhz = 1626.5;
-
 // Retune a live SDR without changing the current FFT/waterfall view.
 void retune_vfo(double hz) {
-    hz = std::clamp(hz, kBandLoMhz * 1e6, kBandHiMhz * 1e6);
+    if (hz <= 0.0) return;
     if (std::fabs(hz - g_vfo_hz) < 1000.0) return;
     g_vfo_hz = hz;
     if (g_source_kind == 1) { g_sdr.set_center_frequency(hz); g_sdr.clear_buffer(); }
@@ -534,84 +536,83 @@ void retune_vfo(double hz) {
     g_freq_mhz.clear();
 }
 
-// Keep the shared FFT/waterfall view inside the Iridium band and inside the
-// SDR's captured passband. If the view leaves the passband, retune the radio
-// so both windows continue to show real data.
+// Keep the shared FFT/waterfall view inside the source's captured passband.
+// For live SDRs, if the view leaves the passband, retune the radio to the
+// centre of the view so both windows continue to show real data.
 void sync_view(double fs_mhz, bool live) {
     double &lo = g_view_lo_mhz, &hi = g_view_hi_mhz;
+    if (fs_mhz <= 0) return;
+
     if (hi <= lo) {
         double fc = active_source()->center_frequency() / 1e6;
-        lo = std::max(kBandLoMhz, fc - fs_mhz * 0.5);
-        hi = std::min(kBandHiMhz, fc + fs_mhz * 0.5);
-        if (hi <= lo) { lo = kBandLoMhz; hi = kBandHiMhz; }
+        lo = fc - fs_mhz * 0.5;
+        hi = fc + fs_mhz * 0.5;
     }
-    double max_span = std::min(kBandHiMhz - kBandLoMhz,
-                               fs_mhz > 0 ? fs_mhz : kBandHiMhz - kBandLoMhz);
+
     double span = hi - lo;
+    double max_span = fs_mhz;
+    if (!live) max_span = std::min(kBandHiMhz - kBandLoMhz, fs_mhz);
     if (span > max_span) {
-        double c = std::clamp((lo + hi) * 0.5, kBandLoMhz + max_span * 0.5,
-                              kBandHiMhz - max_span * 0.5);
+        double c = (lo + hi) * 0.5;
         lo = c - max_span * 0.5;
         hi = c + max_span * 0.5;
         span = max_span;
     }
     if (span < 0.05) {
-        double c = std::clamp((lo + hi) * 0.5, kBandLoMhz + 0.025,
-                              kBandHiMhz - 0.025);
+        double c = (lo + hi) * 0.5;
         lo = c - 0.025;
         hi = c + 0.025;
     }
-    if (lo < kBandLoMhz) { hi += kBandLoMhz - lo; lo = kBandLoMhz; }
-    if (hi > kBandHiMhz) { lo -= hi - kBandHiMhz; hi = kBandHiMhz; }
-    lo = std::max(lo, kBandLoMhz);
-    hi = std::min(hi, kBandHiMhz);
 
-    if (fs_mhz <= 0) return;
+    // IQ files are Iridium captures; keep their view inside the band plan.
+    if (!live) {
+        if (lo < kBandLoMhz) { hi += kBandLoMhz - lo; lo = kBandLoMhz; }
+        if (hi > kBandHiMhz) { lo -= hi - kBandHiMhz; hi = kBandHiMhz; }
+        lo = std::max(lo, kBandLoMhz);
+        hi = std::min(hi, kBandHiMhz);
+    }
 
     double fc = active_source()->center_frequency() / 1e6;
     double cap_lo = fc - fs_mhz * 0.5, cap_hi = fc + fs_mhz * 0.5;
 
     if (live && (lo < cap_lo || hi > cap_hi)) {
-        double desired = (lo + hi) * 0.5;
-        if (fs_mhz <= kBandHiMhz - kBandLoMhz) {
-            desired = std::clamp(desired, kBandLoMhz + fs_mhz * 0.5,
-                                 kBandHiMhz - fs_mhz * 0.5);
-        } else {
-            desired = (kBandLoMhz + kBandHiMhz) * 0.5;
-        }
-        retune_vfo(desired * 1e6);
+        retune_vfo((lo + hi) * 0.5 * 1e6);
         fc = active_source()->center_frequency() / 1e6;
         cap_lo = fc - fs_mhz * 0.5;
         cap_hi = fc + fs_mhz * 0.5;
     }
 
-    // Keep the view inside the captured passband as well. Otherwise the FFT
-    // and the waterfall would be drawn with different frequency ranges.
-    double nlo = std::max(lo, cap_lo);
-    double nhi = std::min(hi, cap_hi);
-    if (nhi <= nlo) {
-        nlo = std::max(cap_lo, kBandLoMhz);
-        nhi = std::min(cap_hi, kBandHiMhz);
-        if (nhi <= nlo) { nlo = cap_lo; nhi = cap_hi; }
-    }
-    lo = std::max(nlo, kBandLoMhz);
-    hi = std::min(nhi, kBandHiMhz);
+    // Keep the view inside the captured passband. Live SDRs were retuned
+    // above if they needed it; IQ files cannot be retuned.
+    lo = std::max(lo, cap_lo);
+    hi = std::min(hi, cap_hi);
+    if (hi <= lo) { lo = cap_lo; hi = cap_hi; }
 }
 
 // Initialise the shared view after a source or sample-rate change.
 double ensure_view() {
     double fs = (active_source()->sample_rate() ? active_source()->sample_rate() : 0) / 1e6;
+    bool live = g_source_kind != 0;
     if (g_view_reset || g_view_hi_mhz <= g_view_lo_mhz) {
         double fc = active_source()->center_frequency() / 1e6;
-        g_view_lo_mhz = std::max(kBandLoMhz, fc - fs * 0.5);
-        g_view_hi_mhz = std::min(kBandHiMhz, fc + fs * 0.5);
-        if (g_view_hi_mhz <= g_view_lo_mhz) {
-            g_view_lo_mhz = kBandLoMhz;
-            g_view_hi_mhz = kBandHiMhz;
+        if (fs > 0) {
+            g_view_lo_mhz = fc - fs * 0.5;
+            g_view_hi_mhz = fc + fs * 0.5;
+        } else {
+            g_view_lo_mhz = fc - 5.0;
+            g_view_hi_mhz = fc + 5.0;
+        }
+        if (!live) {
+            g_view_lo_mhz = std::max(g_view_lo_mhz, kBandLoMhz);
+            g_view_hi_mhz = std::min(g_view_hi_mhz, kBandHiMhz);
+            if (g_view_hi_mhz <= g_view_lo_mhz) {
+                g_view_lo_mhz = kBandLoMhz;
+                g_view_hi_mhz = kBandHiMhz;
+            }
         }
         g_view_reset = false;
         g_view_dirty = true;
-        sync_view(fs, g_source_kind != 0);
+        sync_view(fs, live);
     }
     return fs;
 }
@@ -1071,6 +1072,7 @@ static void draw_band_plan_pixels(ImDrawList *dl, ImVec2 tl, ImVec2 br,
     if (span_mhz <= 1e-9 || br.x <= tl.x || br.y <= tl.y) return;
     double lo = center_mhz - span_mhz * 0.5;
     double hi = center_mhz + span_mhz * 0.5;
+    if (hi < kBandLoMhz || lo > kBandHiMhz) return;
     auto X = [&](double f) {
         return tl.x + (float)((f - lo) / span_mhz) * (br.x - tl.x);
     };
@@ -1234,7 +1236,8 @@ void draw_waterfall_window() {
                     double anchor = g_view_lo_mhz +
                                     (double)(ImGui::GetIO().MousePos.x - rmin.x) /
                                         width * span;
-                    double max_span = std::min(kBandHiMhz - kBandLoMhz, fs_mhz);
+                    double max_span = live ? fs_mhz
+                                           : std::min(kBandHiMhz - kBandLoMhz, fs_mhz);
                     double factor = std::pow(0.85, (double)wheel);
                     double new_span = std::clamp(span * factor, 0.05, max_span);
                     double frac = (anchor - g_view_lo_mhz) / span;
@@ -1958,7 +1961,15 @@ void draw_sdr_source_controls() {
         for (auto &p : selected->ports) ports.push_back(p.c_str());
         ImGui::SetNextItemWidth(200);
         if (ImGui::Combo("Antenna port", &g_sdr_antenna, ports.data(), (int)ports.size())) {
-            if (g_sdr.is_open()) g_sdr.set_antenna(g_sdr_antenna);
+            // Re-open the device so the port is applied through the same
+            // start-up path; live antenna updates are unstable on RSPdx/RSPduo.
+            if (g_sdr.is_open()) {
+                add_log("Restarting SDRplay for antenna port: %s",
+                        selected->ports[g_sdr_antenna].c_str());
+                g_engine.stop();
+                g_sdr.close();
+                start_sdr();
+            }
         }
     }
 

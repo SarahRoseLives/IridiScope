@@ -2603,6 +2603,7 @@ void draw_about_window() {
         ImGui::BulletText("libairspy (Airspy)");
         ImGui::Spacing();
         ImGui::TextWrapped("SDR integration was modelled on AirScope by Sarah Rose.");
+        ImGui::TextWrapped("macOS/Linux build support by Andy Lawendel (@lawendel), PR #10.");
         ImGui::TextWrapped("Equirectangular map imagery courtesy of NASA.");
         ImGui::Spacing();
         ImGui::TextWrapped("Thanks to Jomjom for providing the IQ samples used to develop IridiScope.");

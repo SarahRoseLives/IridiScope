@@ -3112,6 +3112,11 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
     ensure_writable_workdir();
 #endif
+#if defined(__APPLE__)
+    // GLFW would otherwise chdir into the .app's Contents/Resources, so the
+    // layout and voice recordings would be written inside the app bundle.
+    glfwInitHint(GLFW_COCOA_CHDIR_RESOURCES, GLFW_FALSE);
+#endif
     if (!glfwInit()) { fprintf(stderr, "Failed to initialize GLFW\n"); return 1; }
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);

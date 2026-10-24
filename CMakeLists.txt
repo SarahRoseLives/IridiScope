@@ -268,7 +268,19 @@ endif()
 
 # WIN32 => Windows GUI subsystem: no console window on launch.
 if(APPLE AND IRIDISCOPE_MACOS_BUNDLE)
-  add_executable(IridiScope MACOSX_BUNDLE ${APP_SOURCES} ${IMGUI_SOURCES} ${CORE_SOURCES})
+  # App icon (icon.icns next to icon.ico), copied into Contents/Resources.
+  set(IRIDISCOPE_ICNS "${CMAKE_SOURCE_DIR}/icon.icns")
+  set(IRIDISCOPE_ICNS_SRC "")
+  if(EXISTS "${IRIDISCOPE_ICNS}")
+    set(IRIDISCOPE_ICNS_SRC "${IRIDISCOPE_ICNS}")
+    set_source_files_properties("${IRIDISCOPE_ICNS}" PROPERTIES
+      MACOSX_PACKAGE_LOCATION Resources)
+  endif()
+  add_executable(IridiScope MACOSX_BUNDLE ${APP_SOURCES} ${IMGUI_SOURCES} ${CORE_SOURCES}
+                 ${IRIDISCOPE_ICNS_SRC})
+  if(IRIDISCOPE_ICNS_SRC)
+    set_target_properties(IridiScope PROPERTIES MACOSX_BUNDLE_ICON_FILE "icon.icns")
+  endif()
   set_target_properties(IridiScope PROPERTIES
     MACOSX_BUNDLE_BUNDLE_NAME "IridiScope"
     MACOSX_BUNDLE_GUI_IDENTIFIER "dev.sarahsforge.iridiscope"

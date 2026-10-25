@@ -27,13 +27,18 @@ struct VoiceManager::Active {
     int ok = 0;
 };
 
-VoiceManager::VoiceManager() {
+// Create recordings/ in the current working directory (no-op if it exists).
+// Called again before every write: the manager can be constructed before
+// main() picks the working directory (e.g. a Finder launch on macOS).
+static void ensure_recordings_dir() {
 #if defined(_WIN32)
     _mkdir("recordings");
 #else
     mkdir("recordings", 0755);
 #endif
 }
+
+VoiceManager::VoiceManager() { ensure_recordings_dir(); }
 
 VoiceManager::~VoiceManager() {
     std::lock_guard<std::mutex> lk(mtx_);
@@ -52,6 +57,7 @@ void VoiceManager::reset() {
 }
 
 static void write_wav(const std::string &path, const std::vector<int16_t> &pcm, int rate) {
+    ensure_recordings_dir();
     FILE *f = fopen(path.c_str(), "wb");
     if (!f) return;
     uint32_t data_bytes = (uint32_t)(pcm.size() * 2);

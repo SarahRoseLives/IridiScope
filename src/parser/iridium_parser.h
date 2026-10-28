@@ -9,6 +9,7 @@
 #define IRIDISCOPE_IRIDIUM_PARSER_H
 
 #include <cstdint>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -86,14 +87,25 @@ struct ParsedMessage {
     std::string msg_text;           // ASCII preview (fmt 5) or BCD digits (fmt 3)
 
     bool error = false;
+    // Symbols of the 12-symbol unique word that were wrong but tolerated
+    // (iridium-toolkit --uw-ec); 0 = exact match.
+    int uw_errors = 0;
 
     // Voice payload bytes (VOC/VOD/VO6), for the voice subsystem.
     std::vector<uint8_t> voice_payload;
     std::string voice_subtype; // VOC/VOD/VOZ/VDA/VO6
+    // LCW handoff response on a traffic channel: the call's next channel.
+    bool has_handoff = false;
+    int ho_slot = 0, ho_sband_up = 0, ho_sband_dn = 0, ho_access = 0;
+    bool ho_denied = false;
 };
 
 // Classify a raw demodulated frame. Returns true if a type was assigned.
 bool parse_frame(const RawFrame &in, ParsedMessage &out);
+
+// Unique-word error tolerance (iridium-toolkit --uw-ec): accept the access
+// code with up to 3 wrong DQPSK symbols. Off by default upstream.
+extern std::atomic<bool> irid_uw_ec;
 
 } // namespace irid
 

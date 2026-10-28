@@ -1,4 +1,5 @@
 #include "messages/acars.h"
+#include "store/msg_db.h"
 #include "acars/libacars_bridge.h"
 #include "output/gsmtap.h"
 #include "parser/fec.h"
@@ -355,6 +356,7 @@ void AcarsAssembler::decode_acars(const std::vector<uint8_t> &in, double time_s,
     }
 
     acars_cnt_++;
+    MsgDb::instance().acars(m);
     msgs_.push_back(m);
     if (msgs_.size() > 2000) msgs_.pop_front();
 }
@@ -555,6 +557,7 @@ void AcarsAssembler::record_sbd(const std::string &typ, const std::vector<uint8_
     m.acars = (!data.empty() && data[0] == 0x01);
     decode_sbd_preheader(prehdr, data, m);
     decode_nal10(data, m);
+    MsgDb::instance().sbd(m);
     sbd_msgs_.push_back(std::move(m));
     if (sbd_msgs_.size() > 1000) sbd_msgs_.pop_front();
     sbd_msg_cnt_++;
@@ -588,6 +591,7 @@ void AcarsAssembler::emit_sbd_payload(const std::vector<uint8_t> &pin, double ti
         m.ul = ul;
         if (decode_sms_tpdu(tpdu, m)) {
             sms_cnt_++;
+            MsgDb::instance().sms(m);
             sms_.push_back(m);
             if (sms_.size() > 500) sms_.pop_front();
         }

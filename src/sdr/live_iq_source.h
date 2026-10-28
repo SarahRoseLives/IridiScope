@@ -34,6 +34,7 @@ public:
     uint64_t total_samples() const override { return 0; } // live / unknown
     size_t read_cf32(float *out, size_t max_samples) override; // blocks
     void close() override;
+    uint64_t take_gap() override;
     bool done() const override { return !open_.load(); }
     void wake() override;
 
@@ -69,6 +70,14 @@ public:
     void set_lna_agc(bool on);
     bool lna_agc() const { return lna_agc_; }
     void set_mixer_agc(bool on);
+    void set_allow_unofficial_rates(bool on);
+    // Overrun diagnostics: samples the radio delivered, and samples dropped
+    // because processing could not keep up (each drop can cut bursts).
+    uint64_t dropped_samples() const { return dropped_.load(); }
+    uint64_t received_samples() const { return received_.load(); }
+    uint64_t driver_dropped_samples() const { return sdr_ ? sdr_->driverDroppedSamples() : 0; }
+    bool reports_driver_drops() const { return sdr_ && sdr_->reportsDriverDrops(); }
+    double buffer_seconds() const { return sample_rate_ > 0 ? (double)cap_ / sample_rate_ : 0.0; }
     bool mixer_agc() const { return mixer_agc_; }
 
     bool running() const;
@@ -103,13 +112,26 @@ private:
     int mixer_ = 8;
     bool lna_agc_ = false;
     bool mixer_agc_ = false;
+    bool unofficial_rates_ = false;
 
     mutable std::mutex mtx_;
     std::condition_variable cv_;
     std::vector<float> ring_; // cap_*2 floats
-    size_t cap_ = 1u << 20;   // complex samples buffered
+    void size_ring(double rate_hz); // (re)allocate ~1 s of samples; drops contents
+    size_t cap_ = 1u << 20;   // complex samples buffered (resized on open)
+    std::atomic<uint64_t> dropped_{0};   // samples discarded because the engine fell behind
+    std::atomic<uint64_t> received_{0};  // samples delivered by the radio
     size_t head_ = 0;         // oldest complex index
     size_t count_ = 0;        // complex samples available
+    // Stream positions (complex samples since the radio started) for
+    // gap tracking: rpos_ = next sample read_cf32() returns, wpos_ = next
+    // sample written. gaps_: samples lost just before position .first.
+    uint64_t rpos_ = 0, wpos_ = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> gaps_;
+    uint64_t last_gap_ = 0;   // gap before the block last returned
+    uint64_t drv_seen_ = 0;   // driver-dropped count already accounted for
+    void reset_positions();
+    void add_gap(uint64_t pos, uint64_t n);
 };
 
 } // namespace iridi

@@ -1,6 +1,7 @@
 #include "sdr/live_iq_source.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace iridi {
 
@@ -33,7 +34,46 @@ std::unique_ptr<SdrSource> make_sdr_source(SdrKind kind) {
 
 LiveIqSource::LiveIqSource(SdrKind kind, double center_hz, double sample_rate_hz)
     : kind_(kind), center_hz_(center_hz), sample_rate_(sample_rate_hz) {
-    ring_.resize(cap_ * 2);
+    // The buffer is allocated when the radio starts, sized to its rate, so
+    // idle backends don't hold memory.
+}
+
+// About one second of samples (at least the original 1 Mi): long enough to
+// ride out the processing thread being held up briefly (other SDR programs,
+// UI work), without adding latency while processing keeps up.
+void LiveIqSource::size_ring(double rate_hz) {
+    const size_t want = std::max<size_t>(1u << 20, (size_t)std::llround(std::max(0.0, rate_hz) * 1.0));
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (want != cap_ || ring_.size() != want * 2) {
+        cap_ = want;
+        std::vector<float>().swap(ring_);
+        ring_.assign(cap_ * 2, 0.0f);
+    }
+    head_ = 0;
+    count_ = 0;
+    reset_positions();
+}
+
+// Caller holds mtx_.
+void LiveIqSource::reset_positions() {
+    rpos_ = wpos_ = 0;
+    gaps_.clear();
+    last_gap_ = 0;
+    drv_seen_ = sdr_ ? sdr_->driverDroppedSamples() : 0;
+}
+
+// Caller holds mtx_. Gaps are kept in position order; same position merges.
+void LiveIqSource::add_gap(uint64_t pos, uint64_t n) {
+    if (!n) return;
+    if (!gaps_.empty() && gaps_.back().first >= pos) { gaps_.back().second += n; return; }
+    gaps_.emplace_back(pos, n);
+}
+
+uint64_t LiveIqSource::take_gap() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    const uint64_t g = last_gap_;
+    last_gap_ = 0;
+    return g;
 }
 
 LiveIqSource::~LiveIqSource() { close(); }
@@ -81,12 +121,11 @@ bool LiveIqSource::open(int device_index, double center_hz, double sample_rate_h
     sdr_->setMixerGain(mixer_);
     sdr_->setLnaAgc(lna_agc_);
     sdr_->setMixerAgc(mixer_agc_);
+    sdr_->setAllowUnofficialRates(unofficial_rates_);
 
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        head_ = 0;
-        count_ = 0;
-    }
+    size_ring(sample_rate_);
+    dropped_.store(0);
+    received_.store(0);
     open_.store(true);
 
     std::string e;
@@ -96,6 +135,12 @@ bool LiveIqSource::open(int device_index, double center_hz, double sample_rate_h
         err = e.empty() ? "failed to start SDRplay device" : e;
         return false;
     }
+    // The backend may have adjusted the rate to one the device supports
+    // (e.g. Airspy Mini: 6 / 3 Msps); the DSP must use the real value.
+    if (sdr_->sampleRate() > 0 && sdr_->sampleRate() != sample_rate_) {
+        sample_rate_ = sdr_->sampleRate();
+        size_ring(sample_rate_);
+    }
     return true;
 }
 
@@ -103,6 +148,11 @@ void LiveIqSource::close() {
     open_.store(false);
     cv_.notify_all();
     if (sdr_) sdr_->stop();
+    std::lock_guard<std::mutex> lk(mtx_);
+    std::vector<float>().swap(ring_); // free the buffer while stopped
+    head_ = 0;
+    count_ = 0;
+    reset_positions();
 }
 
 void LiveIqSource::wake() {
@@ -117,11 +167,18 @@ void LiveIqSource::set_center_frequency(double hz) {
 
 void LiveIqSource::set_sample_rate(double hz) {
     sample_rate_ = hz;
-    if (sdr_) sdr_->setSampleRate(hz);
+    if (sdr_) {
+        sdr_->setSampleRate(hz);
+        if (sdr_->sampleRate() > 0) sample_rate_ = sdr_->sampleRate();
+    }
+    if (open_.load()) size_ring(sample_rate_);
 }
 
 void LiveIqSource::clear_buffer() {
     std::lock_guard<std::mutex> lk(mtx_);
+    // The discarded samples are a gap in the stream: keep time continuous.
+    add_gap(wpos_, count_);
+    rpos_ = wpos_;
     head_ = 0;
     count_ = 0;
 }
@@ -212,22 +269,50 @@ std::string LiveIqSource::device_name() const {
 void LiveIqSource::on_samples(const float *iq, int n) {
     if (n <= 0) return;
     std::lock_guard<std::mutex> lk(mtx_);
+    if (ring_.size() < cap_ * 2) return; // not allocated (stopped)
     size_t un = (size_t)n;
+    received_.fetch_add(un);
+
+    // Samples the driver lost before this block (Airspy reports them per
+    // transfer, on this same thread, just before delivering the block).
+    if (sdr_ && sdr_->reportsDriverDrops()) {
+        const uint64_t d = sdr_->driverDroppedSamples();
+        if (d > drv_seen_) add_gap(wpos_, d - drv_seen_);
+        drv_seen_ = d;
+    }
 
     // A block larger than the ring keeps only the newest cap_ samples.
     if (un > cap_) {
+        const size_t lost = un - cap_ + count_;
+        dropped_.fetch_add(lost);
         iq += (un - cap_) * 2;
         un = cap_;
         head_ = 0;
         count_ = 0;
+        // Everything up to the kept part is lost: one gap just before it.
+        // (Discarded samples never got a stream position.)
+        uint64_t g = lost;
+        for (auto &e : gaps_) g += e.second;
+        gaps_.clear();
+        rpos_ = wpos_;
+        add_gap(rpos_, g);
     }
 
     // Drop the oldest samples to make room, preserving ordering.
     if (count_ + un > cap_) {
         size_t drop = count_ + un - cap_;
+        dropped_.fetch_add(drop);
         head_ += drop;
         if (head_ >= cap_) head_ -= cap_;
         count_ -= drop;
+        // The dropped samples become a gap at the new read position; any
+        // gaps inside the dropped span merge into it.
+        rpos_ += drop;
+        uint64_t g = drop;
+        size_t k = 0;
+        while (k < gaps_.size() && gaps_[k].first <= rpos_) g += gaps_[k++].second;
+        gaps_.erase(gaps_.begin(), gaps_.begin() + k);
+        gaps_.insert(gaps_.begin(), {rpos_, g});
     }
 
     for (size_t i = 0; i < un; ++i) {
@@ -237,6 +322,7 @@ void LiveIqSource::on_samples(const float *iq, int n) {
         ring_[2 * idx + 1] = iq[2 * i + 1];
         ++count_;
     }
+    wpos_ += un;
     cv_.notify_all();
 }
 
@@ -246,7 +332,14 @@ size_t LiveIqSource::read_cf32(float *out, size_t max_samples) {
     cv_.wait(lk, [this] { return count_ > 0 || !open_.load(); });
     if (count_ == 0) return 0;
 
+    // Report the gap (if any) right before this block, and never let a block
+    // run across a later gap.
+    last_gap_ = 0;
+    size_t gi = 0;
+    while (gi < gaps_.size() && gaps_[gi].first <= rpos_) last_gap_ += gaps_[gi++].second;
+    gaps_.erase(gaps_.begin(), gaps_.begin() + gi);
     size_t k = std::min(max_samples, count_);
+    if (!gaps_.empty() && gaps_.front().first - rpos_ < k) k = (size_t)(gaps_.front().first - rpos_);
     for (size_t i = 0; i < k; ++i) {
         size_t idx = head_ + i;
         if (idx >= cap_) idx -= cap_;
@@ -256,7 +349,15 @@ size_t LiveIqSource::read_cf32(float *out, size_t max_samples) {
     head_ += k;
     if (head_ >= cap_) head_ -= cap_;
     count_ -= k;
+    rpos_ += k;
     return k;
 }
 
+} // namespace iridi
+
+namespace iridi {
+void LiveIqSource::set_allow_unofficial_rates(bool on) {
+    unofficial_rates_ = on;
+    if (sdr_) sdr_->setAllowUnofficialRates(on);
+}
 } // namespace iridi

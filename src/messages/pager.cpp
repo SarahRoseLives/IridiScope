@@ -1,4 +1,5 @@
 #include "messages/pager.h"
+#include "store/msg_db.h"
 
 #include <cstdio>
 
@@ -69,6 +70,7 @@ void PagerAssembler::emit(Entry &e) {
         m.ok = false;
     }
 
+    if (m.ok) MsgDb::instance().pager(m);
     msgs_.push_back(m);
     if (msgs_.size() > 1000) msgs_.pop_front();
     count_++;

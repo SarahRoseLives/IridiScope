@@ -115,6 +115,14 @@ struct _burst_downmix {
 
     /* Pre-start samples */
     int pre_start_samples;
+
+    /* Two-stage decimation (IridiScope): built on first use for a 10 MSPS
+     * input. Stage 1 (/8) only has to remove what would alias into the
+     * output band; the sharp filter then runs at 1/8 of the input rate. */
+    fir_filter_t *dec1_fir, *dec2_fir;
+    int dec_rate;               /* input rate the stages were built for */
+    float complex *dec_mid;     /* stage-1 output */
+    int dec_mid_cap;
 };
 
 /* ---- Utility: next power of 2 ---- */
@@ -388,6 +396,9 @@ void burst_downmix_destroy(burst_downmix_t *dm) {
     if (!dm) return;
 
     fir_filter_destroy(dm->input_fir);
+    if (dm->dec1_fir) fir_filter_destroy(dm->dec1_fir);
+    if (dm->dec2_fir) fir_filter_destroy(dm->dec2_fir);
+    free(dm->dec_mid);
     fir_filter_destroy(dm->noise_fir);
     fir_filter_destroy(dm->start_fir);
     fir_filter_destroy(dm->rrc_fir);
@@ -435,6 +446,48 @@ static int decimate_burst(burst_downmix_t *dm, const float complex *in, int in_l
     int n_out = (in_len - dm->input_fir->ntaps + 1) / decimation;
     if (n_out <= 0) return 0;
     if (n_out > dm->work_size) n_out = dm->work_size;
+
+    /* IridiScope: two-stage decimation at 10 MSPS (Airspy 10 MSPS mode).
+     * Same passband (0-75 kHz flat, stop from 125 kHz) and alias rejection
+     * within 3 dB of the single 801-tap filter, at about half the work.
+     * Other rates keep the original single stage. */
+    if (in_sample_rate == 10000000 && decimation == 40) {
+        const int d1 = 8, d2 = decimation / d1;
+        if (!dm->dec1_fir || dm->dec_rate != in_sample_rate) {
+            if (dm->dec1_fir) fir_filter_destroy(dm->dec1_fir);
+            if (dm->dec2_fir) fir_filter_destroy(dm->dec2_fir);
+            float mid_rate = (float)in_sample_rate / d1;
+            float edge = dm->output_sample_rate * 0.5f;      /* old filter's stop edge */
+            float stop1 = mid_rate - edge;                    /* first freq aliasing into the output band */
+            float tw = 0.5f * (stop1 - edge);
+            int nt;
+            float *t = lpf_taps(&nt, 1.0f, (float)in_sample_rate, edge + 0.5f * tw, tw);
+            dm->dec1_fir = fir_filter_create(t, nt);
+            free(t);
+            t = lpf_taps(&nt, 1.0f, mid_rate, dm->output_sample_rate * 0.4f,
+                         dm->output_sample_rate * 0.2f);
+            dm->dec2_fir = fir_filter_create(t, nt);
+            free(t);
+            dm->dec_rate = in_sample_rate;
+        }
+        int n_mid = (in_len - dm->dec1_fir->ntaps + 1) / d1;
+        if (n_mid <= 0) return 0;
+        if (n_mid > dm->dec_mid_cap) {
+            free(dm->dec_mid);
+            dm->dec_mid = malloc(sizeof(float complex) * n_mid);
+            if (!dm->dec_mid) { dm->dec_mid_cap = 0; return 0; }
+            dm->dec_mid_cap = n_mid;
+        }
+        fir_filter_ccf_dec(dm->dec1_fir, dm->dec_mid, in, n_mid, d1);
+        n_out = (n_mid - dm->dec2_fir->ntaps + 1) / d2;
+        if (n_out <= 0) return 0;
+        if (n_out > dm->work_size) n_out = dm->work_size;
+        fir_filter_ccf_dec(dm->dec2_fir, out, dm->dec_mid, n_out, d2);
+        if (timestamp)
+            *timestamp += (uint64_t)((dm->dec1_fir->ntaps / 2) * 1000000000ULL / in_sample_rate)
+                        + (uint64_t)((dm->dec2_fir->ntaps / 2) * (uint64_t)d1 * 1000000000ULL / in_sample_rate);
+        return n_out;
+    }
 
     fir_filter_ccf_dec(dm->input_fir, out, in, n_out, decimation);
 
@@ -653,6 +706,44 @@ static int correlate_sync(burst_downmix_t *dm, const float complex *frame,
     return uw_start;
 }
 
+/* Rotate n samples by a constant frequency, 8 independent phase lanes so the
+ * multiply chain is not one long serial dependency (vectorizes with SSE2).
+ * Lanes are renormalized every block to keep |phase| = 1. */
+static void rotate_fast(float complex *out, const float complex *in, int n,
+                        float complex phase, float complex incr) {
+    enum { L = 8, BLK = 1024 };
+    float pr[L], pi[L];
+    float complex p = phase;
+    for (int k = 0; k < L; k++) { pr[k] = crealf(p); pi[k] = cimagf(p); p *= incr; }
+    float complex inc8 = 1.0f;
+    for (int k = 0; k < L; k++) inc8 *= incr;
+    const float ir = crealf(inc8), ii = cimagf(inc8);
+    const float *x = (const float *)in; float *y = (float *)out;
+    int i = 0;
+    while (i + L <= n) {
+        int end = i + BLK; if (end > n) end = n;
+        for (; i + L <= end; i += L) {
+            float xr[L], xi[L];
+            for (int k = 0; k < L; k++) { xr[k] = x[2 * (i + k)]; xi[k] = x[2 * (i + k) + 1]; }
+            for (int k = 0; k < L; k++) {
+                y[2 * (i + k)]     = xr[k] * pr[k] - xi[k] * pi[k];
+                y[2 * (i + k) + 1] = xr[k] * pi[k] + xi[k] * pr[k];
+            }
+            for (int k = 0; k < L; k++) {
+                float nr = pr[k] * ir - pi[k] * ii;
+                float ni = pr[k] * ii + pi[k] * ir;
+                pr[k] = nr; pi[k] = ni;
+            }
+        }
+        for (int k = 0; k < L; k++) {
+            float m = sqrtf(pr[k] * pr[k] + pi[k] * pi[k]);
+            if (m > 0) { pr[k] /= m; pi[k] /= m; }
+        }
+    }
+    float complex q = pr[0] + pi[0] * I;
+    for (; i < n; i++) { out[i] = in[i] * q; q *= incr; }
+}
+
 /* ---- Process one burst ---- */
 
 int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
@@ -665,8 +756,6 @@ int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
     int n = (int)burst->num_samples;
     if (n > dm->work_size) n = dm->work_size;
 
-    /* Copy burst samples to working buffer */
-    memcpy(dm->work_a, burst->samples, n * sizeof(float complex));
 
     double center_frequency = burst->center_frequency;
     int in_sample_rate = burst->sample_rate;
@@ -678,11 +767,9 @@ int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
     float relative_freq = (burst->info.center_bin - burst->fft_size / 2)
                           / (float)burst->fft_size;
     {
-        rotator_t r;
-        rotator_init(&r);
+        /* IridiScope: rotate straight from the burst buffer (no copy). */
         float phase_inc = -2.0f * (float)M_PI * relative_freq;
-        rotator_set_phase_incr(&r, cexpf(phase_inc * I));
-        rotator_rotate_n(&r, dm->work_a, dm->work_a, n);
+        rotate_fast(dm->work_a, burst->samples, n, 1.0f, cexpf(phase_inc * I));
         center_frequency += relative_freq * in_sample_rate;
     }
 
@@ -835,7 +922,7 @@ void *burst_downmix_thread(void *arg) {
             free(frames);
         }
 
-        free(burst->samples);
+        burst_release_samples(burst);
         free(burst);
     }
 

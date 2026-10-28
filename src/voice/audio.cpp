@@ -16,11 +16,16 @@ struct AudioPlayer::Impl {
     std::vector<int16_t> pcm;
     std::atomic<size_t> pos{0};
     std::atomic<bool> *playing = nullptr;
+    std::atomic<bool> *paused = nullptr;
 };
 
 static void data_callback(ma_device *dev, void *out, const void * /*in*/, ma_uint32 frames) {
     auto *im = (AudioPlayer::Impl *)dev->pUserData;
     int16_t *o = (int16_t *)out;
+    if (im->paused && im->paused->load()) {
+        std::memset(o, 0, frames * sizeof(int16_t));
+        return;
+    }
     size_t p = im->pos.load();
     size_t n = im->pcm.size();
     for (ma_uint32 i = 0; i < frames; i++) {
@@ -33,6 +38,7 @@ static void data_callback(ma_device *dev, void *out, const void * /*in*/, ma_uin
 
 AudioPlayer::AudioPlayer() : impl_(new Impl()) {
     impl_->playing = &playing_;
+    impl_->paused = &paused_;
 }
 
 AudioPlayer::~AudioPlayer() {
@@ -77,6 +83,7 @@ bool AudioPlayer::play(const std::vector<int16_t> &pcm, int sample_rate) {
         if (ma_device_init(nullptr, &cfg, &impl_->device) != MA_SUCCESS) return false;
         impl_->inited = true;
     }
+    paused_.store(false);
     playing_.store(true);
     if (ma_device_start(&impl_->device) != MA_SUCCESS) { playing_.store(false); return false; }
     return true;
@@ -89,6 +96,27 @@ void AudioPlayer::set_volume(float v) {
 void AudioPlayer::stop() {
     if (impl_ && impl_->inited) ma_device_stop(&impl_->device);
     playing_.store(false);
+    paused_.store(false);
+}
+
+void AudioPlayer::pause()  { if (playing_.load()) paused_.store(true); }
+void AudioPlayer::resume() { paused_.store(false); }
+
+void AudioPlayer::seek(float sec) {
+    if (!impl_ || !impl_->inited || impl_->pcm.empty()) return;
+    const size_t n = impl_->pcm.size();
+    size_t p = (size_t)std::max(0.0, (double)sec * impl_->rate);
+    if (p >= n) p = n - 1;
+    impl_->pos.store(p);
+    if (!playing_.load()) {
+        playing_.store(true);
+        ma_device_start(&impl_->device);   // no-op if still running
+    }
+}
+
+float AudioPlayer::position_sec() const {
+    if (!impl_ || impl_->rate <= 0) return 0.0f;
+    return (float)((double)impl_->pos.load() / impl_->rate);
 }
 
 } // namespace iridi

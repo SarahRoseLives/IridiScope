@@ -1,10 +1,41 @@
 #include "core/engine.h"
+#include "store/msg_db.h"
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include <chrono>
+#include <cmath>
+#include <ctime>
 #include <cstdio>
 #include <cstring>
 
 namespace iridi {
+
+namespace {
+// CPU time used by the calling thread so far.
+uint64_t thread_cpu_ns() {
+#if defined(_WIN32)
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0;
+    const uint64_t kk = ((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime;
+    const uint64_t uu = ((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime;
+    return (kk + uu) * 100;   // 100 ns units
+#else
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+} // namespace
+
 
 extern "C" void ir_engine_frame_cb(const ir_frame_info_t *info, void *user) {
     static_cast<Engine *>(user)->on_frame(info);
@@ -23,6 +54,10 @@ bool Engine::start(IqSource *source, float threshold) {
 
     pipe_ = ir_pipeline_create(center, rate, threshold, 0, ir_engine_frame_cb, this);
     if (!pipe_) return false;
+    // A recording with a known start time (from its file name) keeps that
+    // time; live sources start at the current time.
+    if (start_time_ns_) ir_pipeline_set_start_time(static_cast<ir_pipeline_t *>(pipe_), start_time_ns_);
+    start_time_ns_ = 0;
 
     total_samples_.store(source->total_samples());
     samples_.store(0);
@@ -40,9 +75,13 @@ bool Engine::start(IqSource *source, float threshold) {
         spectrum_inst_.clear();
         spectrum_avg_.clear();
         parsed_count_.store(0);
+        uw_recovered_.store(0);
+        uw_tolerated_failed_.store(0);
         parse_error_count_.store(0);
     }
+    voice_.flush_all(); // keep anything left from a previous run
     voice_.reset();
+    voice_recovered_.store(0);
     acars_.reset();
     pager_.reset();
     spectrum_seq_.store(0);
@@ -62,9 +101,38 @@ void Engine::stop() {
         ir_pipeline_destroy(static_cast<ir_pipeline_t *>(pipe_));
         pipe_ = nullptr;
     }
+    iq_rec_.stop();
+    // Save calls that were still in progress (Stop, new source, exit).
+    voice_.flush_all();
 }
 
+bool Engine::start_iq_recording(const std::string &dir, std::string &err) {
+    if (!running_.load() || !source_) { err = "start a radio first"; return false; }
+    if (source_->total_samples() != 0) { err = "recording is for live radios (this is a file)"; return false; }
+    return iq_rec_.start(dir, source_->sample_rate(), source_->center_frequency(), err);
+}
+
+void Engine::stop_iq_recording() { iq_rec_.stop(); }
+
 void Engine::on_frame(const ir_frame_info_t *info) {
+    {
+        // A targeted read can occasionally decode a burst the detector also
+        // caught (its detection started off-slot). Keep only the first copy
+        // of any frame pair where one came from a targeted read.
+        struct Seen { uint64_t ts; double f; bool probe; };
+        static std::mutex seen_mtx;
+        static Seen seen[2048];
+        static unsigned seen_n = 0;
+        const bool probe = (info->id >> 63) != 0;
+        std::lock_guard<std::mutex> lk(seen_mtx);
+        const unsigned n = seen_n < 2048 ? seen_n : 2048;
+        for (unsigned i = 0; i < n; i++) {
+            const Seen &x = seen[(seen_n - 1 - i) % 2048];
+            const uint64_t dt = x.ts > info->timestamp_ns ? x.ts - info->timestamp_ns : info->timestamp_ns - x.ts;
+            if ((probe || x.probe) && dt < 3000000ULL && std::fabs(x.f - info->frequency) < 20000.0) return;
+        }
+        seen[seen_n++ % 2048] = Seen{info->timestamp_ns, info->frequency, probe};
+    }
     if (raw_dump_.load()) {
         static std::mutex dump_mtx;
         std::lock_guard<std::mutex> lk(dump_mtx);
@@ -109,8 +177,20 @@ void Engine::on_frame(const ir_frame_info_t *info) {
     irid::parse_frame(rf, pm);
     parsed_count_.fetch_add(1);
     if (pm.error) parse_error_count_.fetch_add(1);
+    if (pm.uw_errors > 0) {
+        // Frame accepted only thanks to unique-word tolerance.
+        if (pm.error) uw_tolerated_failed_.fetch_add(1);
+        else uw_recovered_.fetch_add(1);
+    }
     last_ts_.store(pm.timestamp_ns);
-    if (!pm.voice_payload.empty()) voice_.feed(pm);
+    if (!pm.voice_payload.empty()) {
+        voice_.feed(pm);
+        // Let the pipeline target this call's next bursts (weak ones the
+        // detector misses). Only real speech frames, not VOD data.
+        if (!pm.error && pm.voice_subtype != "VOD" && pipe_)
+            ir_pipeline_voice_seen(static_cast<ir_pipeline_t *>(pipe_), pm.timestamp_ns, pm.frequency);
+        if (!pm.error && (info->id >> 63)) voice_recovered_.fetch_add(1);
+    }
     if (pm.has_ida) acars_.feed(pm);
     if (pm.has_msg) pager_.feed(pm);
 
@@ -142,6 +222,7 @@ void Engine::on_frame(const ir_frame_info_t *info) {
             e.sat = pm.ira_sat; e.beam = pm.ira_beam;
             e.tmsi = p.tmsi; e.msc_id = p.msc_id;
             pages_.push_back(e);
+            MsgDb::instance().ring_alert(e.timestamp_ns, e.sat, e.beam, e.tmsi, e.msc_id);
             g.pages++;
             if (pages_.size() > 20000) pages_.pop_front();
         }
@@ -154,10 +235,55 @@ void Engine::on_frame(const ir_frame_info_t *info) {
 }
 
 void Engine::set_center_frequency(double hz) {
-    if (pipe_) ir_pipeline_set_center(static_cast<ir_pipeline_t *>(pipe_), hz);
+    if (pipe_) {
+        ir_pipeline_set_center(static_cast<ir_pipeline_t *>(pipe_), hz);
+        // The spectrum under the detector changed: its learned noise floor
+        // no longer applies.
+        ir_pipeline_reset_noise(static_cast<ir_pipeline_t *>(pipe_));
+    }
+}
+
+int Engine::worker_threads() const {
+    return pipe_ ? ir_pipeline_workers(static_cast<ir_pipeline_t *>(pipe_)) : 0;
+}
+
+void Engine::set_queue_budget(double bytes) { ir_pipeline_set_queue_budget(bytes); }
+void Engine::set_live_backlog(double seconds) { ir_pipeline_set_live_backlog(seconds); }
+
+uint64_t Engine::targeted_reads() const {
+    uint64_t pr = 0;
+    if (pipe_) ir_pipeline_probe_stats(static_cast<ir_pipeline_t *>(pipe_), &pr, nullptr);
+    return pr;
+}
+
+uint64_t Engine::skipped_bursts() const {
+    return pipe_ ? ir_pipeline_skipped(static_cast<ir_pipeline_t *>(pipe_)) : 0;
+}
+
+int Engine::queue_capacity() const {
+    return pipe_ ? ir_pipeline_queue_capacity(static_cast<ir_pipeline_t *>(pipe_)) : 0;
+}
+
+uint64_t Engine::queue_full_count() const {
+    return pipe_ ? ir_pipeline_queue_full(static_cast<ir_pipeline_t *>(pipe_)) : 0;
+}
+
+float Engine::detector_noise_floor() const {
+    return pipe_ ? ir_pipeline_noise_floor(static_cast<ir_pipeline_t *>(pipe_)) : 0.0f;
+}
+
+void Engine::reset_noise_floor() {
+    if (pipe_) ir_pipeline_reset_noise(static_cast<ir_pipeline_t *>(pipe_));
 }
 
 void Engine::thread_main() {
+    // The burst detector is the one thread that must keep up with the radio
+    // (anything it misses is lost), so it runs at high priority. It is light
+    // now that bursts aren't copied; the decoders run at normal priority and
+    // skip the oldest bursts if they fall too far behind.
+#if defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
     const size_t block = 65536; // complex samples per read
     std::vector<float> buf(block * 2);
 
@@ -179,8 +305,34 @@ void Engine::thread_main() {
             if (source_->done()) { done_.store(true); break; }
             continue;
         }
+        // Samples lost just before this block (driver or buffer overrun):
+        // advance the detector's clock so timestamps stay on real time.
+        const uint64_t gap = source_->take_gap();
+        if (gap) {
+            ir_pipeline_skip_samples(static_cast<ir_pipeline_t *>(pipe_), gap);
+            gap_samples_.fetch_add(gap);
+        }
+        if (iq_rec_.active()) iq_rec_.push(buf.data(), n, gap);
 
-        ir_pipeline_feed(static_cast<ir_pipeline_t *>(pipe_), buf.data(), n);
+        {
+            // Detector CPU time: real work, as opposed to elapsed time (which
+            // also counts time the thread was waiting for a CPU).
+            const uint64_t cpu0 = thread_cpu_ns();
+            // Detector load: time spent detecting vs the signal time it covers.
+            // Waiting for burst-queue space is not detector work: count it apart.
+            ir_pipeline_t *pp = static_cast<ir_pipeline_t *>(pipe_);
+            const uint64_t w0 = ir_pipeline_queue_wait_ns(pp);
+            const auto f0 = std::chrono::steady_clock::now();
+            ir_pipeline_feed(pp, buf.data(), n);
+            const uint64_t spent = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - f0).count();
+            const uint64_t waited = ir_pipeline_queue_wait_ns(pp) - w0;
+            det_busy_ns_.fetch_add(spent > waited ? spent - waited : 0);
+            det_wait_ns_.fetch_add(waited);
+            const uint64_t cpu1 = thread_cpu_ns();
+            if (cpu1 > cpu0) det_cpu_ns_.fetch_add(cpu1 - cpu0);
+            det_samples_.fetch_add(n);
+        }
         samples_.fetch_add(n);
         voice_.sweep(last_ts_.load());
 

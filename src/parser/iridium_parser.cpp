@@ -11,6 +11,7 @@
 namespace irid {
 
 int irid_debug = 0; // set via --frame to trace classification
+std::atomic<bool> irid_uw_ec{true};
 
 // ---- constants (bitsparser.py) --------------------------------------------
 static const Bits iridium_access = "001100000011000011110011";
@@ -18,6 +19,23 @@ static const Bits uplink_access  = "110011000011110011111100";
 static const Bits next_access_dl = "110011110011111111111100";
 static const Bits next_access_ul = "001111000000000011111111";
 static const Bits header_messaging = "00110011111100110011001111110011";
+
+// Unique words as DQPSK symbols (iridium-toolkit bitsparser.py).
+static const int UW_DOWNLINK[12] = {0,2,2,2,2,0,0,0,2,0,0,2};
+static const int UW_UPLINK[12]   = {2,2,0,0,0,2,0,0,2,0,2,2};
+
+// Bits back to differentially decoded DQPSK symbols (bitsparser.py de_dqpsk).
+static void de_dqpsk(const Bits &bits, int n_symbols, int *out) {
+    static const int imap[4] = {0, 1, 3, 2};
+    for (int i = 0; i < n_symbols; i++)
+        out[i] = imap[(bits[2 * i] == '1' ? 2 : 0) + (bits[2 * i + 1] == '1' ? 1 : 0)];
+    for (int i = 1; i < n_symbols; i++) out[i] = (out[i - 1] + out[i]) % 4;
+}
+static int symdiff(const int *a, const int *b, int n) {
+    int d = 0;
+    for (int i = 0; i < n; i++) d += a[i] != b[i];
+    return d;
+}
 static const Bits header_time_location = "11" + Bits(94, '0');
 static const int messaging_bch_poly  = 1897;
 static const int ringalert_bch_poly  = 1207;
@@ -90,6 +108,10 @@ struct Frame {
     Bits lcw1, lcw2, lcw3;
     std::string lcw_header;
     bool lcw_ok = false;
+    // handoff_resp fields (iridium-toolkit bitsparser.py layout)
+    bool ho = false;
+    int ho_slot = 0, ho_sband_up = 0, ho_sband_dn = 0, ho_access = 0;
+    bool ho_denied = false;
 };
 } // namespace
 
@@ -178,8 +200,15 @@ static void build_lcw_header(Frame &f) {
         const char *code; char extra[120] = "";
         if (lcw_code == 12) code = "handoff_cand";
         else if (lcw_code == 3) { code = "handoff_resp";
-            snprintf(extra, sizeof(extra), "[cand:%c,slot:%d,sband_up:%d,sband_dn:%d]",
-                     bits_to_int(l3,2,3) ? 'S' : 'P', 1 + bits_to_int(l3,6,8), bits_to_int(l3,8,13), bits_to_int(l3,13,18)); }
+            f.ho = true;
+            f.ho_denied = bits_to_int(l3,3,4) != 0;
+            f.ho_slot = 1 + bits_to_int(l3,6,8);
+            f.ho_sband_up = bits_to_int(l3,8,13);
+            f.ho_sband_dn = bits_to_int(l3,13,18);
+            f.ho_access = 1 + bits_to_int(l3,18,21);
+            snprintf(extra, sizeof(extra), "[cand:%c,denied:%d,slot:%d,sband_up:%d,sband_dn:%d,access:%d]",
+                     bits_to_int(l3,2,3) ? 'S' : 'P', f.ho_denied ? 1 : 0, f.ho_slot,
+                     f.ho_sband_up, f.ho_sband_dn, f.ho_access); }
         else if (lcw_code == 15) code = "<silent>";
         else { static char rs[24]; snprintf(rs, sizeof(rs), "rsrvd(%d)", lcw_code); code = rs; }
         snprintf(buf, sizeof(buf), "LCW(%d,T:hndof,C:%s%s)", f.ft, code, extra);
@@ -613,6 +642,12 @@ static void body_lcw(Frame &f, ParsedMessage &out) {
     // f.descrambled_bits holds the 312-bit data after LCW; ft set.
     const Bits &data = f.descrambled_bits;
     build_lcw_header(f);
+    if (f.ho) {
+        out.has_handoff = true;
+        out.ho_slot = f.ho_slot; out.ho_sband_up = f.ho_sband_up;
+        out.ho_sband_dn = f.ho_sband_dn; out.ho_access = f.ho_access;
+        out.ho_denied = f.ho_denied;
+    }
     if (f.ft == 0) {
         // VO: classify VDA / VO6 / VOD / VOZ / VOC (bitsparser.py IridiumVOMessage).
         auto chunks = slice(data, 8);
@@ -730,9 +765,22 @@ bool parse_frame(const RawFrame &in, ParsedMessage &out) {
     else if (starts(next_access_dl)) { f.uplink = 0; f.next = true; }
     else if (starts(next_access_ul)) { f.uplink = 1; f.next = true; }
     else {
-        if (irid_debug) fprintf(stderr, "[cls] no access code; bs[0..24]=%s len=%zu\n",
-                                bs.substr(0, 24).c_str(), bs.size());
-        out.error = true; out.type = "ERR"; out.pretty = "Access code missing"; return false;
+        // Tolerate up to 3 wrong symbols in the unique word (iridium-toolkit
+        // --uw-ec). A random burst matches within 3 of 12 quaternary symbols
+        // with probability ~0.04%, and later ECC rejects most of those.
+        bool recovered = false;
+        if (irid_uw_ec.load(std::memory_order_relaxed) && bs.size() >= iridium_access.size()) {
+            int sym[12];
+            de_dqpsk(bs, 12, sym);
+            const int ddl = symdiff(sym, UW_DOWNLINK, 12), dul = symdiff(sym, UW_UPLINK, 12);
+            if (ddl < 4) { f.uplink = 0; out.uw_errors = ddl; recovered = true; }
+            else if (dul < 4) { f.uplink = 1; out.uw_errors = dul; recovered = true; }
+        }
+        if (!recovered) {
+            if (irid_debug) fprintf(stderr, "[cls] no access code; bs[0..24]=%s len=%zu\n",
+                                    bs.substr(0, 24).c_str(), bs.size());
+            out.error = true; out.type = "ERR"; out.pretty = "Access code missing"; return false;
+        }
     }
 
     if (f.next) { out.type = "NX"; out.pretty = "NX (next-gen)"; return true; }

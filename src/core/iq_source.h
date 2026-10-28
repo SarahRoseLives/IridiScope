@@ -42,6 +42,11 @@ public:
     // The engine calls this before joining its worker thread on stop.
     virtual void wake() {}
 
+    // Complex samples lost just before the block the last read_cf32() returned
+    // (driver or buffer overruns). Reading it clears it. The engine uses this
+    // to keep burst timestamps on wall-clock time across drops.
+    virtual uint64_t take_gap() { return 0; }
+
     // Seeking is only meaningful for file-backed sources.
     virtual bool seekable() const { return false; }
     virtual bool seek_sample(uint64_t) { return false; }

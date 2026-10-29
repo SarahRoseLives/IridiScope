@@ -23,7 +23,7 @@
 namespace iridi {
 
 namespace {
-enum Table { T_ACARS = 1, T_SMS, T_SBD, T_PAGER, T_VOICE, T_RING };
+enum Table { T_ACARS = 1, T_SMS, T_SBD, T_PAGER, T_VOICE, T_RING, T_VOICE_TX };
 
 const char *kSchema = R"SQL(
 PRAGMA journal_mode=WAL;
@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS pager (
 CREATE TABLE IF NOT EXISTS voice_calls (
   id INTEGER PRIMARY KEY, time_utc TEXT, ts REAL, end_ts REAL, freq_mhz REAL,
   duration_s REAL, speech_s REAL, frames INTEGER, missing INTEGER,
-  error_pct REAL, handoffs INTEGER, type TEXT, wav TEXT, announcement TEXT);
+  error_pct REAL, handoffs INTEGER, type TEXT, wav TEXT, announcement TEXT,
+  language TEXT, transcript TEXT, transcript_en TEXT);
 CREATE TABLE IF NOT EXISTS ring_alerts (
   id INTEGER PRIMARY KEY, time_utc TEXT, ts REAL, sat INTEGER, beam INTEGER,
   tmsi TEXT, msc_id INTEGER);
@@ -73,6 +74,7 @@ const Spec kSpecs[] = {
     {"INSERT INTO voice_calls(time_utc,ts,end_ts,freq_mhz,duration_s,speech_s,frames,missing,error_pct,handoffs,type,wav,announcement)"
      " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", "TNNNNNNNNNTTT"},
     {"INSERT INTO ring_alerts(time_utc,ts,sat,beam,tmsi,msc_id) VALUES(?,?,?,?,?,?)", "TNNNTN"},
+    {"UPDATE voice_calls SET language=?, transcript=?, transcript_en=? WHERE wav=?", "TTTT"},
 };
 
 std::string utc(uint64_t ts_ns) {
@@ -145,8 +147,8 @@ void MsgDb::writer_main() {
         q_.clear();
         return;
     }
-    sqlite3_stmt *st[7] = {};
-    for (int i = 1; i <= 6; i++) sqlite3_prepare_v2(db_, kSpecs[i].sql, -1, &st[i], nullptr);
+    sqlite3_stmt *st[8] = {};
+    for (int i = 1; i <= 7; i++) sqlite3_prepare_v2(db_, kSpecs[i].sql, -1, &st[i], nullptr);
     int prio_gen = 0;
     for (;;) {
         iridi_refresh_thread_priority(IRIDI_PRIO_NORMAL, &prio_gen);
@@ -231,6 +233,13 @@ void MsgDb::voice(const VoiceCall &c) {
     auto r2 = [](double v) { return std::round(v * 100.0) / 100.0; };
     r.num = {secs(c.start_ns), secs(c.end_ns), std::round(c.channel_hz) / 1e6, r2(c.duration_s), r2(c.speech_s),
              (double)c.frames, (double)c.missing, r2(100.0 * c.error_ratio), (double)c.handoffs};
+    push(std::move(r));
+}
+
+void MsgDb::voice_transcript(const std::string &wav, const std::string &lang, const std::string &text,
+                             const std::string &text_en) {
+    Row r; r.table = T_VOICE_TX;
+    r.text = {lang, text, text_en, wav};
     push(std::move(r));
 }
 

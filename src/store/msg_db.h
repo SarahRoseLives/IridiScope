@@ -47,6 +47,9 @@ public:
     void pager(const PagerMessage &m);
     void voice(const VoiceCall &c);
     void ring_alert(uint64_t ts_ns, int sat, int beam, uint32_t tmsi, int msc_id);
+    // Fills in a saved call's transcript (matched by WAV path).
+    void voice_transcript(const std::string &wav, const std::string &lang, const std::string &text,
+                          const std::string &text_en);
 
 private:
     MsgDb() = default;

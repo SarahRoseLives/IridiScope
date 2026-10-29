@@ -51,6 +51,7 @@ extern char **environ;
 #endif
 
 #include "core/priority.h"
+#include "voice/transcriber.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "implot.h"
@@ -248,6 +249,13 @@ bool g_show_waterfall = true;
 bool g_show_bursts = true;
 bool g_show_messages = true;
 bool g_show_log = true;
+// Speech-to-text (voice/transcriber.h)
+bool g_show_stt = false;
+bool g_stt_on = false;
+bool g_stt_translate = false;
+bool g_stt_large_all = true;    // every call on large-v3-turbo when downloaded
+char g_stt_vocab[1024] = "Iridium, Ornge, MedAire, MedLink, MEL, ATC, dispatch, maintenance control, "
+                         "captain, first officer, flight number, ETA, roger, copy, stand by";
 // Log categories ("[TAG] " after the time): Status, Alerts, Radio, Voice,
 // Handoffs, Other (untagged). Shown/hidden in the Log window; saved.
 bool g_log_cat[6] = {true, true, true, true, false, true};
@@ -1238,6 +1246,7 @@ void draw_menu_bar() {
             ImGui::MenuItem("Bursts", nullptr, &g_show_bursts);
             ImGui::MenuItem("Messages", nullptr, &g_show_messages);
             ImGui::MenuItem("Log", nullptr, &g_show_log);
+            ImGui::MenuItem("Transcription", nullptr, &g_show_stt);
             ImGui::Separator();
             if (ImGui::MenuItem("Reset layout")) {
                 // Re-open every docked pane, then rebuild the default arrangement.
@@ -3240,6 +3249,108 @@ void update_autoplay() {
     }
 }
 
+// Transcript of the selected call, under its waveform.
+static void draw_call_transcript(const iridi::VoiceCall &c) {
+    auto &tx = stt::Transcriber::instance();
+    if (c.tx_state == 2) {
+        ImGui::TextDisabled("Transcript (%s)", c.language.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy##tx")) {
+            std::string s = c.transcript;
+            if (!c.transcript_en.empty()) s += "\n\nEnglish:\n" + c.transcript_en;
+            ImGui::SetClipboardText(s.c_str());
+        }
+        const float h = ImGui::GetTextLineHeightWithSpacing() * (c.transcript_en.empty() ? 4.5f : 7.5f);
+        ImGui::BeginChild("##txtext", ImVec2(0, h), true);
+        ImGui::TextWrapped("%s", c.transcript.c_str());
+        if (!c.transcript_en.empty()) {
+            ImGui::Spacing();
+            ImGui::TextDisabled("English:");
+            ImGui::TextWrapped("%s", c.transcript_en.c_str());
+        }
+        ImGui::EndChild();
+    } else if (c.tx_state == 1) {
+        ImGui::TextDisabled(tx.busy_id() == c.id ? "Transcribing..." : "Queued for transcription (%d waiting)", tx.queued());
+    } else if (c.tx_state == 3) {
+        ImGui::TextDisabled("Transcript: no speech found");
+    } else if (!c.active && !c.wav_path.empty() && c.announcement.empty()) {
+        if (!g_stt_on || tx.model_state(0) != stt::ModelState::Ready) {
+            ImGui::TextDisabled("No transcript.");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Set up transcription...")) g_show_stt = true;
+        } else if (ImGui::SmallButton(c.tx_state == 4 ? "Transcribe again" : "Transcribe")) {
+            g_engine.voices().request_transcript(c.id);
+        }
+    }
+}
+
+// View > Transcription: models, options.
+static void draw_transcription_window() {
+    if (!g_show_stt) return;
+    ImGui::SetNextWindowSize(ImVec2(560, 420), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Transcription", &g_show_stt)) {
+        auto &tx = stt::Transcriber::instance();
+        if (!stt::Transcriber::available()) {
+            ImGui::TextWrapped("This build doesn't include speech-to-text: whisper.cpp wasn't found when it was "
+                               "compiled. See the build notes for how to add it.");
+            ImGui::End();
+            return;
+        }
+        ImGui::TextWrapped("Saved voice calls are turned into text on this PC (whisper.cpp; nothing is sent "
+                           "anywhere). It runs after each call ends at the lowest priority, so it never takes "
+                           "CPU from the radio or the decoders. The text is shown in the Voice tab, saved next "
+                           "to the WAV as a .txt and in the message database.");
+        ImGui::Separator();
+        static const char *names[2] = {"Small model (every call, detects language)",
+                                       "Large-v3-turbo (re-does non-English calls, optional)"};
+        for (int m = 0; m < 2; m++) {
+            ImGui::PushID(m);
+            ImGui::TextUnformatted(names[m]);
+            const stt::ModelState st = tx.model_state(m);
+            if (st == stt::ModelState::Ready) {
+                ImGui::SameLine(); ImGui::TextColored(ImVec4(0.5f, 1, 0.5f, 1), "ready");
+            } else if (st == stt::ModelState::Downloading) {
+                char b[48]; snprintf(b, sizeof(b), "%.0f of %.0f MB", tx.download_progress(m) * tx.model_size_mb(m), tx.model_size_mb(m));
+                ImGui::ProgressBar(tx.download_progress(m), ImVec2(260, 0), b);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Cancel")) tx.cancel_download(m);
+            } else {
+                char b[48]; snprintf(b, sizeof(b), "Download (%.0f MB)", tx.model_size_mb(m));
+                if (ImGui::Button(b)) tx.download(m);
+                if (st == stt::ModelState::Failed) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1, .6f, .4f, 1), "failed - see Log"); }
+            }
+            ImGui::PopID();
+        }
+        ImGui::Separator();
+        const bool ready = tx.model_state(0) == stt::ModelState::Ready;
+        if (!ready) ImGui::BeginDisabled();
+        if (ImGui::Checkbox("Transcribe saved calls", &g_stt_on)) {
+            tx.set_enabled(g_stt_on);
+            add_log("[VOICE] Transcription: %s", g_stt_on ? "on" : "off");
+        }
+        if (!ready) { ImGui::EndDisabled(); ImGui::SameLine(); ImGui::TextDisabled("(download the small model first)"); }
+        if (ImGui::Checkbox("Use the large model for all calls", &g_stt_large_all)) tx.set_large_for_all(g_stt_large_all);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("More accurate (names, accents, choppy audio) but about 3-4x slower and\n"
+                              "~1 GB more memory while working. Needs the large model; without it every\n"
+                              "call uses the small one. Off: large only re-does non-English calls.");
+        if (ImGui::Checkbox("Translate non-English calls to English", &g_stt_translate)) tx.set_translate(g_stt_translate);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Adds an English version under the original text. Uses the large model if\n"
+                              "downloaded. Treat translations as rough: on choppy audio Whisper can\n"
+                              "invent sentences when translating.");
+        ImGui::TextDisabled("Words to expect (names, jargon; English calls only):");
+        if (ImGui::InputTextMultiline("##vocab", g_stt_vocab, sizeof(g_stt_vocab), ImVec2(-1, ImGui::GetTextLineHeight() * 4)))
+            tx.set_vocabulary(g_stt_vocab);
+        ImGui::Separator();
+        const int busy = tx.busy_id();
+        if (busy >= 0) ImGui::Text("Transcribing call #%d, %d waiting", busy, tx.queued());
+        else ImGui::TextDisabled("Idle, %d waiting", tx.queued());
+        ImGui::TextDisabled("Models are stored in the models folder next to IridiScope.exe.");
+    }
+    ImGui::End();
+}
+
 void draw_voice_window() {
     if (!g_show_voice) return;
     ImGui::SetNextWindowSize(ImVec2(680, 320), ImGuiCond_FirstUseEver);
@@ -3447,6 +3558,9 @@ void draw_voice_window() {
             } else {
                 ImGui::TextDisabled("Call #%d: no audio captured yet", g_selected_voice);
             }
+            const iridi::VoiceCall *selc = nullptr;
+            for (const auto &c : calls) if (c.id == g_selected_voice) selc = &c;
+            if (selc) draw_call_transcript(*selc);
         }
 
         // Finished calls: sortable, and frozen while the pointer is over the
@@ -3459,7 +3573,7 @@ void draw_voice_window() {
         const float fin_h = std::max(140.0f, ImGui::GetContentRegionAvail().y);
         const ImVec2 fin_p0 = ImGui::GetCursorScreenPos();
         const ImVec2 fin_p1(fin_p0.x + ImGui::GetContentRegionAvail().x, fin_p0.y + fin_h);
-        if (ImGui::BeginTable("calls", 11,
+        if (ImGui::BeginTable("calls", 12,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY |
                 ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate,
                 ImVec2(0, fin_h))) {
@@ -3475,7 +3589,8 @@ void draw_voice_window() {
             ImGui::TableSetupColumn("Err", ImGuiTableColumnFlags_WidthFixed, 50);
             ImGui::TableSetupColumn("Miss", ImGuiTableColumnFlags_WidthFixed, 44);
             ImGui::TableSetupColumn("HO", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_PreferSortDescending, 34);
-            ImGui::TableSetupColumn("Saved", ImGuiTableColumnFlags_NoSort);
+            ImGui::TableSetupColumn("Saved", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 44);
+            ImGui::TableSetupColumn("Transcript", ImGuiTableColumnFlags_NoSort);
             ImGui::TableHeadersRow();
             if (ImGuiTableSortSpecs *ss = ImGui::TableGetSortSpecs()) {
                 if (ss->SpecsCount > 0) {
@@ -3539,6 +3654,33 @@ void draw_voice_window() {
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Not saved: under 1 s of speech (silence or the network's\n"
                                           "once-a-second silence updates only).");
+                }
+                ImGui::TableSetColumnIndex(11);
+                switch (cv.tx_state) {
+                case 1:
+                    ImGui::TextDisabled(stt::Transcriber::instance().busy_id() == cv.id ? "transcribing..." : "queued");
+                    break;
+                case 2: {
+                    ImGui::TextDisabled("[%s]", cv.language.c_str());
+                    ImGui::SameLine(0, 4);
+                    ImGui::TextUnformatted(cv.transcript.c_str());
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::BeginTooltip();
+                        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 40.0f);
+                        ImGui::TextUnformatted(cv.transcript.c_str());
+                        if (!cv.transcript_en.empty()) {
+                            ImGui::Separator();
+                            ImGui::TextDisabled("English:");
+                            ImGui::TextUnformatted(cv.transcript_en.c_str());
+                        }
+                        ImGui::PopTextWrapPos();
+                        ImGui::EndTooltip();
+                    }
+                    break;
+                }
+                case 3: ImGui::TextDisabled("(no speech)"); break;
+                case 4: ImGui::TextDisabled("(failed)"); break;
+                default: break;
                 }
             }
             ImGui::EndTable();
@@ -4933,6 +5075,8 @@ std::vector<SettingRef> settings_table() {
         {"log_status", K::B, &g_log_cat[0], 0}, {"log_alerts", K::B, &g_log_cat[1], 0}, {"log_radio", K::B, &g_log_cat[2], 0},
         {"log_voice", K::B, &g_log_cat[3], 0}, {"log_handoffs", K::B, &g_log_cat[4], 0}, {"log_other", K::B, &g_log_cat[5], 0},
         {"log_status_interval", K::I, &g_status_interval_idx, 0},
+        {"stt_on", K::B, &g_stt_on, 0}, {"stt_translate", K::B, &g_stt_translate, 0}, {"stt_large_all", K::B, &g_stt_large_all, 0},
+        {"stt_vocab", K::S, g_stt_vocab, sizeof(g_stt_vocab)},
         {"fft_idx", K::I, &g_fft_idx, 0}, {"avg_alpha", K::F, &g_avg_alpha, 0},
         {"autoscale", K::B, &g_autoscale, 0}, {"db_min", K::F, &g_db_min, 0}, {"db_max", K::F, &g_db_max, 0},
         {"dc_block", K::B, &g_dc_block, 0},
@@ -5001,6 +5145,10 @@ void settings_apply_all(ImGuiContext *, ImGuiSettingsHandler *) {
     g_queue_budget_idx = std::clamp(g_queue_budget_idx, 0, 3);
     g_backlog_idx = std::clamp(g_backlog_idx, 0, 3);
     ir_set_reject_wide(g_reject_wide);
+    stt::Transcriber::instance().set_enabled(g_stt_on);
+    stt::Transcriber::instance().set_translate(g_stt_translate);
+    stt::Transcriber::instance().set_large_for_all(g_stt_large_all);
+    stt::Transcriber::instance().set_vocabulary(g_stt_vocab);
     iridi_set_boost(g_protect_radio);
     iridi_apply_thread_priority(IRIDI_PRIO_NORMAL);
     g_voice_min_s = std::clamp(g_voice_min_s, 0.0f, 120.0f);
@@ -5327,6 +5475,16 @@ int main(int argc, char **argv) {
                             "/wmts/epsg3857/best/VIIRS_Black_Marble/default/2016-01-01/GoogleMapsCompatible_Level8/%d/%d/%d.png",
                             "mapcache/blackmarble", "png");
     g_tiles_night.start(2);
+    {
+        auto &tx = stt::Transcriber::instance();
+        tx.set_thread_init([] { iridi_apply_thread_priority(IRIDI_PRIO_BACKGROUND); });
+        tx.set_logger([](const std::string &l) { add_log("[VOICE] %s", l.c_str()); });
+        tx.set_vocabulary(g_stt_vocab);
+        tx.set_translate(g_stt_translate);
+        tx.set_large_for_all(g_stt_large_all);
+        tx.set_enabled(g_stt_on);
+        tx.set_models_dir("models");
+    }
 
     g_version_check.start(kUpdateUrl, IRIDISCOPE_VERSION_STRING);
     g_lookup.start();
@@ -5411,6 +5569,7 @@ int main(int argc, char **argv) {
         draw_bursts_window();
         draw_messages_window();
         draw_log_window();
+        draw_transcription_window();
         sweep_tick(); // runs even when the Control panel is hidden
         update_detector_load();
         update_event_tracking();
@@ -5522,6 +5681,7 @@ int main(int argc, char **argv) {
     if (g_ap_scan_thread.joinable()) g_ap_scan_thread.join();
     g_tiles.stop();
     g_tiles_night.stop();
+    stt::Transcriber::instance().shutdown();
     iridi::MsgDb::instance().shutdown();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();

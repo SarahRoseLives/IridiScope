@@ -33,6 +33,11 @@ struct VoiceCall {
     int handoffs = 0;    // channel changes followed via LCW handoff responses
     int missing = 0;     // superframes never received (filled with silence)
     double speech_s = 0; // seconds of actual speech (silence updates excluded)
+    // Speech-to-text (voice/transcriber.h)
+    int tx_state = 0;          // 0 none, 1 queued, 2 done, 3 no speech found, 4 failed
+    std::string language;      // detected language ("en", "es", ...)
+    std::string transcript;    // in the spoken language
+    std::string transcript_en; // English translation (non-English calls, option on)
 };
 
 class VoiceManager {
@@ -50,6 +55,9 @@ public:
     void sweep(uint64_t now_ns);
     // Snapshot for the UI.
     std::vector<VoiceCall> calls() const;
+    // Queue a finished call for transcription (e.g. one saved before it was
+    // turned on). No-op if already queued/done or its audio is gone.
+    void request_transcript(int id);
     std::vector<int16_t> pcm(int id) const;
     int sample_rate() const { return 8000; }
     // Follow calls across handoffs (LCW handoff_resp gives the next channel).
@@ -89,6 +97,7 @@ private:
     std::atomic<bool> sort_ann_{true};
     std::atomic<uint64_t> ann_count_{0};
     std::deque<VoiceCall> done_;
+    void queue_transcript(int id, const std::vector<int16_t> &pcm, const std::string &wav);
     std::deque<std::pair<int, std::vector<int16_t>>> done_pcm_;
     int next_id_ = 0;
     std::atomic<bool> follow_handoffs_{true};

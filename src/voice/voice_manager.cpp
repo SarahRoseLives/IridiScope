@@ -1,6 +1,7 @@
 #include "voice/voice_manager.h"
 #include "store/msg_db.h"
 #include "core/priority.h"
+#include "voice/transcriber.h"
 #include "voice/announce.h"
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -221,6 +222,8 @@ void VoiceManager::writer_main() {
                           job.call.handoffs, ann.empty() ? "" : ", announcement: ", ann.c_str(), job.path.c_str());
             vlog(l);
         }
+        // Speech-to-text (announcements are known text: skipped).
+        if (ann.empty() && stt::Transcriber::instance().enabled()) queue_transcript(job.call.id, job.pcm, job.path);
         const char *csv = "recordings/recordings.csv";
         FILE *probe = std::fopen(csv, "rb");
         const bool fresh = !probe;
@@ -629,6 +632,51 @@ void VoiceManager::sweep(uint64_t now_ns) {
             active_.erase(active_.begin() + i);
         } else ++i;
     }
+}
+
+void VoiceManager::queue_transcript(int id, const std::vector<int16_t> &pcm, const std::string &wav) {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        for (auto &d : done_) if (d.id == id) d.tx_state = 1;
+    }
+    std::string txt = wav;
+    if (txt.size() > 4 && txt.compare(txt.size() - 4, 4, ".wav") == 0) txt.replace(txt.size() - 4, 4, ".txt");
+    else if (!txt.empty()) txt += ".txt";
+    stt::Transcriber::instance().submit(id, pcm, txt, [this, wav](int cid, const stt::Result &r) {
+        char l[600];
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            for (auto &d : done_)
+                if (d.id == cid) {
+                    d.tx_state = !r.ok ? 4 : r.text.empty() ? 3 : 2;
+                    d.language = r.lang; d.transcript = r.text; d.transcript_en = r.text_en;
+                }
+            if (r.ok && !r.text.empty())
+                std::snprintf(l, sizeof(l), "[VOICE] Transcribed call #%d (%s, whisper %s, %.0f s speech in %.0f s): %.300s",
+                              cid, r.lang.c_str(), r.model.c_str(), r.speech_s, r.proc_s, r.text.c_str());
+            else if (r.ok)
+                std::snprintf(l, sizeof(l), "[VOICE] Call #%d: no speech found to transcribe", cid);
+            else
+                std::snprintf(l, sizeof(l), "[ALERT] Transcription of call #%d failed: %s", cid, r.error.c_str());
+            diag_.push_back(l);
+            if (diag_.size() > 200) diag_.pop_front();
+        }
+        if (r.ok && !r.text.empty() && !wav.empty()) MsgDb::instance().voice_transcript(wav, r.lang, r.text, r.text_en);
+    });
+}
+
+void VoiceManager::request_transcript(int id) {
+    std::vector<int16_t> pcm;
+    std::string wav;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        bool found = false;
+        for (const auto &d : done_)
+            if (d.id == id) { found = d.tx_state != 1 && d.tx_state != 2; wav = d.wav_path; }
+        if (!found) return;
+        for (const auto &kv : done_pcm_) if (kv.first == id) pcm = kv.second;
+    }
+    if (!pcm.empty()) queue_transcript(id, pcm, wav);
 }
 
 std::vector<VoiceCall> VoiceManager::calls() const {

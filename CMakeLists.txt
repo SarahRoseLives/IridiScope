@@ -251,6 +251,7 @@ set(APP_SOURCES
   src/store/msg_db.cpp
   src/core/priority.c
   src/voice/announce.cpp
+  src/voice/transcriber.cpp
   src/util/iritime.cpp
   src/voice/voice_manager.cpp
   src/voice/audio.cpp
@@ -349,6 +350,25 @@ if(APPLE)
   # miniaudio's CoreAudio backend.
   target_link_libraries(IridiScope PRIVATE
     "-framework CoreFoundation" "-framework CoreAudio" "-framework AudioToolbox")
+endif()
+
+# whisper.cpp (speech-to-text for voice calls), optional, static: libwhisper +
+# ggml. Without it the app builds as before and transcription is unavailable.
+# On Windows, build ggml with -DGGML_WIN_FORCE_THREAD_PRIORITY=THREAD_PRIORITY_LOWEST
+# (patches/whisper-ggml-thread-priority.patch) so its threads stay at the
+# lowest priority instead of being raised to normal on every compute pass.
+find_path(WHISPER_INCLUDE_DIR whisper.h)
+find_library(WHISPER_LIBRARY NAMES whisper)
+find_library(GGML_LIBRARY NAMES ggml)
+find_library(GGML_CPU_LIBRARY NAMES ggml-cpu)
+find_library(GGML_BASE_LIBRARY NAMES ggml-base)
+if(WHISPER_INCLUDE_DIR AND WHISPER_LIBRARY AND GGML_LIBRARY AND GGML_CPU_LIBRARY AND GGML_BASE_LIBRARY)
+  target_compile_definitions(IridiScope PRIVATE HAS_WHISPER=1)
+  target_include_directories(IridiScope PRIVATE ${WHISPER_INCLUDE_DIR})
+  target_link_libraries(IridiScope PRIVATE ${WHISPER_LIBRARY} ${GGML_LIBRARY} ${GGML_CPU_LIBRARY} ${GGML_BASE_LIBRARY})
+  message(STATUS "whisper.cpp found - voice transcription enabled")
+else()
+  message(STATUS "whisper.cpp not found - voice transcription disabled")
 endif()
 
 # SQLite (message database), linked statically.

@@ -235,6 +235,7 @@ set(APP_SOURCES
   src/app.cpp
   src/core/file_source.cpp
   src/core/engine.cpp
+  src/core/iq_recorder.cpp
   src/sdr/live_iq_source.cpp
   src/acars/aircraft_lookup.cpp
   src/update/version_check.cpp
@@ -246,6 +247,11 @@ set(APP_SOURCES
   src/messages/l3.cpp
   src/output/gsmtap.cpp
   src/ui/waterfall.cpp
+  src/ui/map_tiles.cpp
+  src/store/msg_db.cpp
+  src/core/priority.c
+  src/voice/announce.cpp
+  src/voice/transcriber.cpp
   src/util/iritime.cpp
   src/voice/voice_manager.cpp
   src/voice/audio.cpp
@@ -346,6 +352,31 @@ if(APPLE)
     "-framework CoreFoundation" "-framework CoreAudio" "-framework AudioToolbox")
 endif()
 
+# whisper.cpp (speech-to-text for voice calls), optional, static: libwhisper +
+# ggml. Without it the app builds as before and transcription is unavailable.
+# On Windows, build ggml with -DGGML_WIN_FORCE_THREAD_PRIORITY=THREAD_PRIORITY_LOWEST
+# (patches/whisper-ggml-thread-priority.patch) so its threads stay at the
+# lowest priority instead of being raised to normal on every compute pass.
+find_path(WHISPER_INCLUDE_DIR whisper.h)
+find_library(WHISPER_LIBRARY NAMES whisper)
+find_library(GGML_LIBRARY NAMES ggml)
+find_library(GGML_CPU_LIBRARY NAMES ggml-cpu)
+find_library(GGML_BASE_LIBRARY NAMES ggml-base)
+if(WHISPER_INCLUDE_DIR AND WHISPER_LIBRARY AND GGML_LIBRARY AND GGML_CPU_LIBRARY AND GGML_BASE_LIBRARY)
+  target_compile_definitions(IridiScope PRIVATE HAS_WHISPER=1)
+  target_include_directories(IridiScope PRIVATE ${WHISPER_INCLUDE_DIR})
+  target_link_libraries(IridiScope PRIVATE ${WHISPER_LIBRARY} ${GGML_LIBRARY} ${GGML_CPU_LIBRARY} ${GGML_BASE_LIBRARY})
+  message(STATUS "whisper.cpp found - voice transcription enabled")
+else()
+  message(STATUS "whisper.cpp not found - voice transcription disabled")
+endif()
+
+# SQLite (message database), linked statically.
+find_path(SQLITE3_INCLUDE_DIR sqlite3.h)
+find_library(SQLITE3_LIBRARY NAMES libsqlite3.a sqlite3 REQUIRED)
+target_include_directories(IridiScope PRIVATE ${SQLITE3_INCLUDE_DIR})
+target_link_libraries(IridiScope PRIVATE ${SQLITE3_LIBRARY})
+
 if(FFTW_LIBRARY AND FFTW_INCLUDE_DIR)
   target_include_directories(IridiScope PRIVATE ${FFTW_INCLUDE_DIR})
   target_link_libraries(IridiScope PRIVATE ${FFTW_LIBRARY})
@@ -393,7 +424,7 @@ endif()
 
 if(MINGW)
   target_link_libraries(IridiScope PRIVATE
-    gdi32 user32 shell32 comdlg32 winmm ws2_32 winhttp)
+    gdi32 user32 shell32 comdlg32 winmm ws2_32 winhttp psapi)
 
   # Ship the MinGW runtime DLLs next to the executable so it runs without
   # requiring the toolchain bin directory on PATH.

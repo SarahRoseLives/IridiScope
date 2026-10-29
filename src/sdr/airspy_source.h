@@ -39,6 +39,10 @@ public:
     void setVgaGain(int val) override;    // 0-15 (free mode)
     void setLnaAgc(bool on) override;
     void setMixerAgc(bool on) override;
+    void setAllowUnofficialRates(bool on) override { allowUnofficial_ = on; }
+    uint64_t driverDroppedSamples() const override { return driverDropped_.load(); }
+    bool reportsDriverDrops() const override { return true; }
+    void addDriverDropped(uint64_t n) { if (n) driverDropped_.fetch_add(n); }
 
     double centerFreq() const override { return centerFreq_; }
     double sampleRate() const override { return sampleRate_; }
@@ -53,7 +57,12 @@ public:
 private:
     void applyGain();
     void applyTune();
+    void applyRate();
     uint32_t tunedHz() const;
+
+    std::vector<uint32_t> deviceRates_; // rates the open device supports
+    bool allowUnofficial_ = false;      // Mini: permit unadvertised 10 Msps
+    std::atomic<uint64_t> driverDropped_{0};
 
     airspy_device *dev_ = nullptr;
     uint64_t selectedSerial_ = 0;

@@ -8,11 +8,13 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "core/file_source.h"
+#include "core/iq_recorder.h"
 #include "iridium/pipeline_c.h"
 #include "messages/acars.h"
 #include "messages/pager.h"
@@ -107,6 +109,34 @@ public:
     void set_avg_alpha(float a) { if (pipe_) ir_pipeline_set_avg_alpha((ir_pipeline_t *)pipe_, a); }
     void set_dc_block(bool on) { if (pipe_) ir_pipeline_set_dc_block((ir_pipeline_t *)pipe_, on ? 1 : 0); }
     void set_center_frequency(double hz);
+    void reset_noise_floor(); // after gain changes: re-learn detector baseline
+    float detector_noise_floor() const; // dBFS/Hz, 0 if not running
+    int worker_threads() const;        // downmix/demod workers in the pipeline
+    int queue_capacity() const;        // burst queue size (memory-budgeted)
+    static void set_queue_budget(double bytes); // applies to the next start()
+    // Live radio: seconds the decoders may fall behind before the oldest
+    // bursts are skipped (0 = playback, nothing skipped). Next start().
+    static void set_live_backlog(double seconds);
+    uint64_t skipped_bursts() const;   // bursts skipped (decoders too far behind)
+    uint64_t targeted_reads() const;   // expected voice bursts read without a detection
+    uint64_t voice_recovered() const { return voice_recovered_.load(); } // voice frames those recovered
+    // Detector load accounting (cumulative): busy time and samples processed.
+    uint64_t detector_busy_ns() const { return det_busy_ns_.load(); }
+    uint64_t detector_samples() const { return det_samples_.load(); }
+    // CPU time the detector thread actually used (busy time minus time it
+    // spent waiting for a CPU).
+    uint64_t detector_cpu_ns() const { return det_cpu_ns_.load(); }
+    uint64_t detector_wait_ns() const { return det_wait_ns_.load(); }   // waiting for queue space
+    uint64_t gap_samples() const { return gap_samples_.load(); }        // lost samples skipped in time
+    // Wall-clock time of the first sample for the next start() (0 = now).
+    void set_start_time_ns(uint64_t ns) { start_time_ns_ = ns; }
+    // Raw IQ recording of the live radio (see core/iq_recorder.h).
+    bool start_iq_recording(const std::string &dir, std::string &err);
+    void stop_iq_recording();
+    const IqRecorder &iq_recorder() const { return iq_rec_; }
+    uint64_t uw_recovered() const { return uw_recovered_.load(); }
+    uint64_t uw_tolerated_failed() const { return uw_tolerated_failed_.load(); }
+    uint64_t queue_full_count() const; // bursts that waited for a free worker
 
     std::vector<FrameEvent> recent_frames(size_t max_count) const;
 
@@ -116,9 +146,11 @@ public:
     std::vector<GroundBeam> ground_beams() const;
     std::vector<PageEvent> paging_events(size_t max_count) const;
     uint64_t parsed_count() const { return parsed_count_.load(); }
+    uint64_t last_timestamp() const { return last_ts_.load(); } // newest frame (ns)
     uint64_t parse_error_count() const { return parse_error_count_.load(); }
 
     const VoiceManager &voices() const { return voice_; }
+    VoiceManager &voices() { return voice_; }
     const AcarsAssembler &acars() const { return acars_; }
     const PagerAssembler &pager() const { return pager_; }
 
@@ -149,6 +181,16 @@ private:
     std::atomic<uint64_t> parsed_count_{0};
     std::atomic<uint64_t> parse_error_count_{0};
     std::atomic<uint64_t> last_ts_{0};
+    std::atomic<uint64_t> uw_recovered_{0};        // good frames recovered by UW tolerance
+    std::atomic<uint64_t> uw_tolerated_failed_{0}; // UW tolerated but frame failed later
+    std::atomic<uint64_t> det_busy_ns_{0};   // time spent in the detector
+    std::atomic<uint64_t> det_samples_{0};   // samples it has processed
+    std::atomic<uint64_t> det_cpu_ns_{0};    // detector thread CPU time
+    std::atomic<uint64_t> voice_recovered_{0}; // voice frames from targeted reads
+    std::atomic<uint64_t> det_wait_ns_{0};   // time blocked on a full burst queue
+    std::atomic<uint64_t> gap_samples_{0};   // dropped samples the clock skipped over
+    uint64_t start_time_ns_ = 0;
+    IqRecorder iq_rec_;
 
     VoiceManager voice_;
     AcarsAssembler acars_;

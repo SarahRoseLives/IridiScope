@@ -6,6 +6,7 @@
 #ifndef IRIDISCOPE_SDR_SOURCE_H
 #define IRIDISCOPE_SDR_SOURCE_H
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -20,6 +21,9 @@ struct SdrDeviceInfo {
     // Selectable antenna/input ports, in backend order. Empty when the device
     // has a single fixed input (RSP1/RSP1A/RSP1B, HackRF, Airspy, RTL-SDR).
     std::vector<std::string> ports;
+    // Sample rates (Hz) the device reports, highest first. Empty when the
+    // backend uses a fixed list (or the device could not be queried).
+    std::vector<double> rates;
 };
 
 // Which SDR backend a LiveIqSource should use.
@@ -55,6 +59,13 @@ public:
     virtual void setLinearGain(int) {}// Airspy linearity knob (0-21)
     virtual void setLnaAgc(bool) {}
     virtual void setMixerAgc(bool) {}
+    // Airspy Mini: allow the unofficial 10 Msps mode, which the firmware
+    // supports but does not advertise.
+    virtual void setAllowUnofficialRates(bool) {}
+    // Samples the vendor driver discarded before they reached us (e.g.
+    // libairspy's conversion thread falling behind USB). 0 if unknown.
+    virtual uint64_t driverDroppedSamples() const { return 0; }
+    virtual bool reportsDriverDrops() const { return false; }
 
     virtual double centerFreq() const = 0;
     virtual double sampleRate() const = 0;

@@ -4,6 +4,7 @@
 // live spectrum (ImPlot), scrolling waterfall, and burst statistics.
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #include <commdlg.h>
 #include <shellapi.h>
 #else
@@ -30,6 +31,9 @@ extern char **environ;
 #include <chrono>
 #include <cmath>
 #include <ctime>
+#include <cctype>
+#include <cstring>
+#include <random>
 #include <deque>
 #include <fstream>
 #include <map>
@@ -46,6 +50,8 @@ extern char **environ;
 #include <GL/gl.h>
 #endif
 
+#include "core/priority.h"
+#include "voice/transcriber.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "implot.h"
@@ -57,10 +63,16 @@ extern char **environ;
 
 #include "core/file_source.h"
 #include "core/engine.h"
+#include "iridium/pipeline_c.h"
+#include "store/msg_db.h"
+#include "voice/announce.h"
+#include <filesystem>
+#include "parser/iridium_parser.h"
 #include "acars/aircraft_lookup.h"
 #include "sdr/live_iq_source.h"
 #include "output/gsmtap.h"
 #include "ui/waterfall.h"
+#include "ui/map_tiles.h"
 #include "update/version_check.h"
 #include "util/iritime.h"
 #include "voice/audio.h"
@@ -94,6 +106,7 @@ iridi::LiveIqSource g_rtlsdr(iridi::SdrKind::RTL);
 iridi::Engine g_engine;
 Waterfall g_waterfall;
 iridi::AudioPlayer g_audio;
+int g_audio_call_id = -1;   // voice call loaded in g_audio
 
 // Update check.
 iridi::VersionCheck g_version_check;
@@ -112,6 +125,12 @@ iridi::AcarsMessage g_acars_detail;
 
 // Voice auto-play: newly completed calls are queued and played in order.
 bool g_autoplay = false;
+bool g_voice_hide_failed = true;  // hide finished calls above the error threshold
+bool g_voice_hide_ann = true;     // hide calls that matched a network announcement
+bool g_voice_sort_ann = true;     // file announcement calls under recordings/announcements/
+float g_voice_max_err = 0.50f;    // Err threshold (fraction of failed frames)
+bool g_voice_hide_short = true;   // hide finished calls shorter than g_voice_min_s
+float g_voice_min_s = 1.0f;       // ... seconds
 int g_autoplay_last_id = -1;
 std::deque<int> g_autoplay_queue;
 
@@ -170,7 +189,11 @@ std::thread g_hrf_scan_thread;
 const double kAirspyRates[] = {2.5e6, 3.0e6, 6.0e6, 10.0e6};
 const char *kAirspyRateLabels[] = {"2.5", "3.0", "6.0", "10.0"};
 const int kNumAirspyRates = (int)(sizeof(kAirspyRates) / sizeof(kAirspyRates[0]));
-int g_ap_rate_idx = 3; // 10 MHz
+int g_ap_rate_idx = 3; // 10 MHz (index into the generic list)
+// Selected rate in Hz. When the chosen device reports its own rates (Airspy
+// Mini: 6 / 3 Msps, R2: 10 / 2.5 Msps) only those are offered.
+double g_ap_rate_hz = 0.0; // 0 = not chosen yet -> device's highest rate
+bool g_ap_unofficial10 = false; // Airspy Mini: offer the unadvertised 10 Msps mode
 int g_ap_device_idx = 0;
 int g_ap_gain_mode = 0; // 0=Sensitivity, 1=Linear, 2=Free
 int g_ap_sense = 10;    // 0..21
@@ -204,6 +227,14 @@ bool g_rtl_scan_requested = false;
 std::thread g_rtl_scan_thread;
 
 std::vector<std::string> g_log;
+uint64_t g_log_version = 0;      // bumped on every add_log (lets the Log pane skip copies)
+bool g_reset_layout = false;     // View > Reset layout
+int g_queue_budget_idx = 2;      // burst queue memory: 1/2/4/8 GB (default 4) - playback
+bool g_protect_radio = true;     // ABOVE_NORMAL process class, see core/priority.h
+bool g_reject_wide = true;       // drop wideband (>=150 kHz) carriers before decoding
+int g_backlog_idx = 2;           // live decoder backlog: 1/2/4/8 s (default 4)
+static const double kBacklogS[] = {1.0, 2.0, 4.0, 8.0};
+int g_layout_focus_frames = 0;   // frames until default tab selection is applied
 bool g_show_map = true;
 bool g_show_source = true;
 
@@ -217,6 +248,18 @@ bool g_show_spectrum = true;
 bool g_show_waterfall = true;
 bool g_show_bursts = true;
 bool g_show_messages = true;
+bool g_show_log = true;
+// Speech-to-text (voice/transcriber.h)
+bool g_show_stt = false;
+bool g_stt_on = false;
+bool g_stt_translate = false;
+bool g_stt_large_all = true;    // every call on large-v3-turbo when downloaded
+char g_stt_vocab[1024] = "Iridium, Ornge, MedAire, MedLink, MEL, ATC, dispatch, maintenance control, "
+                         "captain, first officer, flight number, ETA, roger, copy, stand by";
+// Log categories ("[TAG] " after the time): Status, Alerts, Radio, Voice,
+// Handoffs, Other (untagged). Shown/hidden in the Log window; saved.
+bool g_log_cat[6] = {true, true, true, true, false, true};
+int g_status_interval_idx = 1;   // status summary every 30 s / 1 min / 5 min
 bool g_show_sats = true;
 bool g_show_voice = true;
 bool g_show_acars = true;
@@ -256,16 +299,74 @@ double g_view_hi_mhz = 0.0;
 bool g_view_reset = true;
 bool g_view_dirty = false;
 
+std::chrono::steady_clock::time_point g_gain_changed_at;   // last gain change (noise floor alerts)
+
+// Current gain setting of the running SDR, for the log.
+std::string gain_desc() {
+    char b[160];
+    switch (g_source_kind) {
+    case 1: snprintf(b, sizeof(b), "SDRplay %s, gain reduction %.1f dB", g_sdr_agc ? "AGC" : "manual", (double)g_sdr_gr); break;
+    case 2: snprintf(b, sizeof(b), "HackRF LNA %d, VGA %d, amp %s", g_hrf_lna, g_hrf_vga, g_hrf_amp ? "on" : "off"); break;
+    case 3:
+        if (g_ap_gain_mode == 0) snprintf(b, sizeof(b), "Airspy sensitivity %d", g_ap_sense);
+        else if (g_ap_gain_mode == 1) snprintf(b, sizeof(b), "Airspy linearity %d", g_ap_linear);
+        else snprintf(b, sizeof(b), "Airspy LNA %d%s, mixer %d%s, VGA %d", g_ap_lna, g_ap_lna_agc ? " (AGC)" : "",
+                      g_ap_mixer, g_ap_mixer_agc ? " (AGC)" : "", g_ap_vga);
+        break;
+    case 4: snprintf(b, sizeof(b), "RTL-SDR %s", g_rtl_agc ? "AGC" : (std::to_string(g_rtl_gain) + " dB").c_str()); break;
+    default: snprintf(b, sizeof(b), "file playback"); break;
+    }
+    return b;
+}
+
+// Category of a log line from its "[TAG] " (after the "HH:MM:SS  " time):
+// 0 Status, 1 Alerts, 2 Radio, 3 Voice, 4 Handoffs, 5 Other.
+int log_category(const std::string &l) {
+    if (l.size() < 12 || l[10] != '[') return 5;
+    const char *t = l.c_str() + 11;
+    if (!strncmp(t, "STATUS]", 7) || !strncmp(t, "TRAFFIC]", 8)) return 0;
+    if (!strncmp(t, "ALERT]", 6)) return 1;
+    if (!strncmp(t, "RADIO]", 6)) return 2;
+    if (!strncmp(t, "VOICE]", 6)) return 3;
+    if (!strncmp(t, "HANDOFF]", 8)) return 4;
+    return 5;
+}
+
+std::mutex g_log_mtx;
 void add_log(const char *fmt, ...) {
-    char buf[1024];
+    char msg[1024];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+    // Local wall-clock time prefix.
+    char buf[1100];
+    {
+        const auto now = std::chrono::system_clock::now();
+        const std::time_t tt = std::chrono::system_clock::to_time_t(now);
+        std::tm lt{};
+#ifdef _WIN32
+        localtime_s(&lt, &tt);
+#else
+        localtime_r(&tt, &lt);
+#endif
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d  %s", lt.tm_hour, lt.tm_min, lt.tm_sec, msg);
+    }
+    std::lock_guard<std::mutex> lk(g_log_mtx);
     g_log.emplace_back(buf);
+    if (g_log.size() > 5000) g_log.erase(g_log.begin(), g_log.begin() + 1000);
+    g_log_version++;
+    // The GUI build has no console, so keep a file copy next to the exe
+    // (the working directory, like iridiscope.ini and recordings/).
+    static FILE *lf = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        lf = fopen("iridiscope.log", "a");
+        if (lf) fprintf(lf, "---- IridiScope session start ----\n");
+    }
+    if (lf) { fprintf(lf, "%s\n", buf); fflush(lf); }
     fprintf(stdout, "%s\n", buf);
-    fflush(stdout);
-    if (g_log.size() > 2000) g_log.erase(g_log.begin(), g_log.begin() + 500);
 }
 
 void open_url(const char *url) {
@@ -432,9 +533,9 @@ static GLuint upload_map_texture(const unsigned char *pixels, int w, int h,
     int max_tex = 0;
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
     if (max_tex <= 0) max_tex = 2048;
-    // Cap at 4096 even on very large GPUs: the extra detail is not visible in
-    // the map window and this keeps the texture around 32 MB.
-    int limit = std::min(max_tex, 4096);
+    // The map can be zoomed, so keep the full image resolution (the bundled
+    // map is 5400x2700, ~58 MB as RGBA) when the GPU allows it.
+    int limit = std::min(max_tex, 8192);
     int uw = w, uh = h;
     std::vector<unsigned char> scaled;
     const unsigned char *upload = pixels;
@@ -693,13 +794,92 @@ void apply_spectrum_settings() {
     g_engine.set_dc_block(g_dc_block);
 }
 
+// Recording start time from an IQ file name (Unix ns, 0 = unknown), so
+// playback shows when things were actually received:
+//   SDR# / Airspy / HDSDR / IridiScope: ..._YYYYMMDD_HHMMSSZ_...  (UTC)
+//   SDR++: ..._HH-MM-SS_DD-MM-YYYY...                               (local)
+static uint64_t recording_time_from_name(const std::string &path) {
+    std::string name = path;
+    const size_t slash = name.find_last_of("/\\");
+    if (slash != std::string::npos) name = name.substr(slash + 1);
+    auto digits = [&](size_t at, size_t n) {
+        if (at + n > name.size()) return false;
+        for (size_t i = 0; i < n; i++) if (!std::isdigit((unsigned char)name[at + i])) return false;
+        return true;
+    };
+    auto num = [&](size_t at, size_t n) { return std::atoi(name.substr(at, n).c_str()); };
+    for (size_t i = 0; i + 16 <= name.size(); i++) {
+        // YYYYMMDD_HHMMSSZ
+        if (digits(i, 8) && name[i + 8] == '_' && digits(i + 9, 6) && name[i + 15] == 'Z') {
+            std::tm t{};
+            t.tm_year = num(i, 4) - 1900; t.tm_mon = num(i + 4, 2) - 1; t.tm_mday = num(i + 6, 2);
+            t.tm_hour = num(i + 9, 2); t.tm_min = num(i + 11, 2); t.tm_sec = num(i + 13, 2);
+            if (t.tm_mon < 0 || t.tm_mon > 11 || t.tm_mday < 1 || t.tm_mday > 31 || t.tm_hour > 23) continue;
+#ifdef _WIN32
+            const std::time_t tt = _mkgmtime(&t);
+#else
+            const std::time_t tt = timegm(&t);
+#endif
+            if (tt > 0) return (uint64_t)tt * 1000000000ULL;
+        }
+        // HH-MM-SS_DD-MM-YYYY
+        if (i + 19 <= name.size() && digits(i, 2) && name[i + 2] == '-' && digits(i + 3, 2) && name[i + 5] == '-' &&
+            digits(i + 6, 2) && name[i + 8] == '_' && digits(i + 9, 2) && name[i + 11] == '-' &&
+            digits(i + 12, 2) && name[i + 14] == '-' && digits(i + 15, 4)) {
+            std::tm t{};
+            t.tm_hour = num(i, 2); t.tm_min = num(i + 3, 2); t.tm_sec = num(i + 6, 2);
+            t.tm_mday = num(i + 9, 2); t.tm_mon = num(i + 12, 2) - 1; t.tm_year = num(i + 15, 4) - 1900;
+            t.tm_isdst = -1;
+            if (t.tm_mon < 0 || t.tm_mon > 11 || t.tm_mday < 1 || t.tm_mday > 31 || t.tm_hour > 23) continue;
+            const std::time_t tt = std::mktime(&t);
+            if (tt > 0) return (uint64_t)tt * 1000000000ULL;
+        }
+    }
+    return 0;
+}
+
 void start_engine() {
     iridi::IqSource *src = active_source();
     if (!src->is_open()) { add_log("ERROR: no source open"); return; }
     g_autoplay_last_id = -1;
     g_autoplay_queue.clear();
-    if (g_engine.start(src)) { apply_spectrum_settings(); add_log("Engine started"); }
-    else add_log("ERROR: failed to start engine");
+    {
+        static const double gb[] = {1.0, 2.0, 4.0, 8.0};
+        iridi::Engine::set_queue_budget(gb[std::clamp(g_queue_budget_idx, 0, 3)] * 1.0e9);
+        iridi::Engine::set_live_backlog(g_source_kind != 0 ? kBacklogS[std::clamp(g_backlog_idx, 0, 3)] : 0.0);
+    }
+    if (g_source_kind == 0) {
+        // Playback: stamp frames with the recording's own time when the file
+        // name carries it (offset by where playback starts in the file).
+        const uint64_t t0 = recording_time_from_name(g_file.info().path);
+        if (t0 && g_file.sample_rate() > 0) {
+            g_engine.set_start_time_ns(t0 + (uint64_t)((double)g_file.tell_sample() * 1e9 / g_file.sample_rate()));
+            static std::string logged;
+            if (logged != g_file.info().path) {
+                logged = g_file.info().path;
+                const std::time_t tt = (std::time_t)(t0 / 1000000000ULL);
+                std::tm u{};
+#ifdef _WIN32
+                gmtime_s(&u, &tt);
+#else
+                gmtime_r(&tt, &u);
+#endif
+                char b[40]; std::strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S UTC", &u);
+                add_log("Playback times taken from the file name: recording started %s", b);
+            }
+        }
+    }
+    if (g_engine.start(src)) {
+        apply_spectrum_settings();
+        if (g_source_kind != 0)
+            add_log("[RADIO] Engine started: %d decoder worker threads (+1 detector thread), %.0f s decoder backlog",
+                    g_engine.worker_threads(), kBacklogS[std::clamp(g_backlog_idx, 0, 3)]);
+        else
+            add_log("[RADIO] Engine started: %d decoder worker threads (+1 detector thread), burst queue %d (%s budget)",
+                    g_engine.worker_threads(), g_engine.queue_capacity(),
+                    g_queue_budget_idx == 0 ? "1 GB" : g_queue_budget_idx == 1 ? "2 GB" : g_queue_budget_idx == 2 ? "4 GB" : "8 GB");
+    }
+    else add_log("[ALERT] ERROR: failed to start engine");
 }
 
 // Retune a live SDR without changing the current FFT/waterfall view.
@@ -811,7 +991,7 @@ void apply_sample_rate(int kind, double hz) {
     g_spec_seq = 0;
     g_freq_mhz.clear();
     g_view_reset = true;
-    add_log("Sample rate -> %.2f Msps", hz / 1e6);
+    add_log("[RADIO] Sample rate -> %.2f Msps", hz / 1e6);
     if (was_running) start_engine();
 }
 
@@ -863,7 +1043,7 @@ void start_sdr() {
                 port_label = ports[g_sdr_antenna];
         }
     }
-    add_log("SDRplay started: %s @ %.6f MHz, %.1f Msps%s%s", g_sdr.device_name().c_str(),
+    add_log("[RADIO] SDRplay started: %s @ %.6f MHz, %.1f Msps%s%s", g_sdr.device_name().c_str(),
             g_vfo_hz / 1e6, kSdrplayRates[g_sdr_rate_idx] / 1e6,
             port_label.empty() ? "" : ", port ", port_label.c_str());
     g_waterfall.clear();
@@ -889,7 +1069,7 @@ void start_hackrf() {
         add_log("ERROR: %s", err.c_str());
         return;
     }
-    add_log("HackRF started: %s @ %.6f MHz, %.1f Msps (LNA %d, VGA %d, amp %s)",
+    add_log("[RADIO] HackRF started: %s @ %.6f MHz, %.1f Msps (LNA %d, VGA %d, amp %s)",
             g_hackrf.device_name().c_str(), g_vfo_hz / 1e6,
             kHackrfRates[g_hrf_rate_idx] / 1e6, g_hrf_lna, g_hrf_vga, g_hrf_amp ? "on" : "off");
     g_waterfall.clear();
@@ -915,13 +1095,19 @@ void start_airspy() {
     g_airspy.set_lna_agc(g_ap_lna_agc);
     g_airspy.set_mixer_agc(g_ap_mixer_agc);
     g_airspy.set_bias_tee(g_ap_bias);
+    g_airspy.set_allow_unofficial_rates(g_ap_unofficial10);
     std::string err;
-    if (!g_airspy.open(g_ap_device_idx, g_vfo_hz, kAirspyRates[g_ap_rate_idx], err)) {
+    const double want = g_ap_rate_hz > 0 ? g_ap_rate_hz : kAirspyRates[g_ap_rate_idx];
+    if (!g_airspy.open(g_ap_device_idx, g_vfo_hz, want, err)) {
         add_log("ERROR: %s", err.c_str());
         return;
     }
-    add_log("Airspy started: %s @ %.6f MHz, %.1f Msps", g_airspy.device_name().c_str(),
-            g_vfo_hz / 1e6, kAirspyRates[g_ap_rate_idx] / 1e6);
+    const double got = (double)g_airspy.sample_rate();
+    if (std::fabs(got - want) > 1.0)
+        add_log("[RADIO] Airspy: %.1f Msps not supported by this device, using %.1f Msps", want / 1e6, got / 1e6);
+    g_ap_rate_hz = got;
+    add_log("[RADIO] Airspy started: %s @ %.6f MHz, %.1f Msps", g_airspy.device_name().c_str(),
+            g_vfo_hz / 1e6, got / 1e6);
     g_waterfall.clear();
     g_spec_seq = 0;
     g_freq_mhz.clear();
@@ -944,7 +1130,7 @@ void start_rtl() {
         add_log("ERROR: %s", err.c_str());
         return;
     }
-    add_log("RTL-SDR started: %s @ %.6f MHz, %.2f Msps", g_rtlsdr.device_name().c_str(),
+    add_log("[RADIO] RTL-SDR started: %s @ %.6f MHz, %.2f Msps", g_rtlsdr.device_name().c_str(),
             g_vfo_hz / 1e6, kRtlRates[g_rtl_rate_idx] / 1e6);
     g_waterfall.clear();
     g_spec_seq = 0;
@@ -955,11 +1141,90 @@ void start_rtl() {
 
 // ---- panels ---------------------------------------------------------------
 
+bool g_msgdb_on = true;   // message database (File menu)
+
+// "Sort existing recordings now": moves announcement WAVs out of recordings/
+// on a background thread; the result is logged when it finishes.
+std::atomic<bool> g_sort_running{false};
+std::atomic<int> g_sort_done{-1}, g_sort_moved{0}, g_sort_checked{0};
+void start_sort_existing() {
+    if (g_sort_running.exchange(true)) return;
+    g_sort_moved = 0; g_sort_checked = 0; g_sort_done = -1;
+    add_log("Sorting existing recordings: checking WAVs in recordings/ for network announcements...");
+    std::thread([] {
+        iridi_apply_thread_priority(IRIDI_PRIO_BACKGROUND);   // never competes with decoding
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        std::vector<fs::path> files;
+        for (auto &e : fs::directory_iterator("recordings", ec))
+            if (e.is_regular_file() && e.path().extension() == ".wav") files.push_back(e.path());
+        for (const auto &p : files) {
+            std::vector<int16_t> pcm;
+            if (FILE *f = std::fopen(p.string().c_str(), "rb")) {
+                std::fseek(f, 0, SEEK_END);
+                const long n = std::ftell(f);
+                if (n > 44) {
+                    std::fseek(f, 44, SEEK_SET);
+                    pcm.resize((size_t)(n - 44) / 2);
+                    pcm.resize(std::fread(pcm.data(), 2, pcm.size(), f));
+                }
+                std::fclose(f);
+            }
+            g_sort_checked++;
+            const std::string ann = iridi::AnnouncementMatcher::instance().classify(pcm);
+            if (ann.empty()) continue;
+            const fs::path dir = fs::path("recordings") / "announcements" / ann;
+            fs::create_directories(dir, ec);
+            fs::rename(p, dir / p.filename(), ec);
+            if (!ec) g_sort_moved++;
+        }
+        g_sort_done = (int)files.size();
+        g_sort_running = false;
+    }).detach();
+}
+
 void draw_menu_bar() {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Open IQ file...", "Ctrl+O")) g_request_open = true;
-            if (ImGui::MenuItem("Close")) { g_engine.stop(); g_file.close(); g_sdr.close(); g_hackrf.close(); g_airspy.close(); g_rtlsdr.close(); g_waterfall.clear(); add_log("Closed source"); }
+            if (ImGui::MenuItem("Close")) { g_engine.stop(); g_file.close(); g_sdr.close(); g_hackrf.close(); g_airspy.close(); g_rtlsdr.close(); g_waterfall.clear(); add_log("[RADIO] Closed source"); }
+            ImGui::Separator();
+            {
+                bool on = g_msgdb_on;
+                if (ImGui::MenuItem("Log messages to database", nullptr, &on)) {
+                    g_msgdb_on = on;
+                    iridi::MsgDb::instance().set_enabled(on);
+                }
+                if (ImGui::IsItemHovered()) {
+                    const std::string pth = iridi::MsgDb::instance().path();
+                    ImGui::SetTooltip("ACARS, SMS, SBD, pager, voice calls and ring alerts go into an SQLite\n"
+                                      "file per session in logs\\ (open with DB Browser for SQLite etc.).\n%s%s",
+                                      pth.empty() ? "No messages logged yet this session." : "This session: ",
+                                      pth.c_str());
+                }
+                {
+                    bool so = g_voice_sort_ann;
+                    if (ImGui::MenuItem("File announcement calls separately", nullptr, &so)) {
+                        g_voice_sort_ann = so;
+                        g_engine.voices().set_sort_announcements(so);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("New calls that match a network announcement are saved under\n"
+                                          "recordings\\announcements\\<name>\\ instead of recordings\\.");
+                    if (ImGui::MenuItem("Sort existing recordings now", nullptr, false, !g_sort_running.load()))
+                        start_sort_existing();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Checks every WAV directly in recordings\\ and moves the ones that are a\n"
+                                          "network announcement into recordings\\announcements\\<name>\\.\n"
+                                          "Everything else is left untouched.");
+                }
+                if (ImGui::MenuItem("Open logs folder")) {
+#ifdef _WIN32
+                    CreateDirectoryA("logs", nullptr);
+                    ShellExecuteA(nullptr, "open", "logs", nullptr, nullptr, SW_SHOWNORMAL);
+#endif
+                }
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Quit", "Alt+F4")) glfwSetWindowShouldClose(g_window, 1);
             ImGui::EndMenu();
@@ -980,6 +1245,14 @@ void draw_menu_bar() {
             ImGui::MenuItem("Waterfall", nullptr, &g_show_waterfall);
             ImGui::MenuItem("Bursts", nullptr, &g_show_bursts);
             ImGui::MenuItem("Messages", nullptr, &g_show_messages);
+            ImGui::MenuItem("Log", nullptr, &g_show_log);
+            ImGui::MenuItem("Transcription", nullptr, &g_show_stt);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Reset layout")) {
+                // Re-open every docked pane, then rebuild the default arrangement.
+                g_show_map = g_show_messages = g_show_log = g_show_sats = g_show_voice = true;
+                g_reset_layout = true;
+            }
             ImGui::MenuItem("Satellites", nullptr, &g_show_sats);
             ImGui::MenuItem("Paging", nullptr, &g_show_paging);
             ImGui::MenuItem("Voice", nullptr, &g_show_voice);
@@ -1025,64 +1298,367 @@ void project_to_map(double lat, double lon, const ImVec2 &pos, const ImVec2 &siz
     out.y = pos.y + (float)((90.0 - lat) / 180.0 * size.y);
 }
 
+// Ageing for satellites and spot beams. Positions are only as fresh as the
+// last ring alert: a satellite moves ~7 km/s, so stale markers are faded and
+// then hidden. "Now" is the later of the newest frame time and the wall clock
+// (frame times are wall-clock based; file playback can run ahead of it).
+float g_sat_hide_after_s = 120.0f;
+bool g_sat_show_stale = false;
+static uint64_t ring_now_ns() {
+    const uint64_t wall = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    return std::max(wall, g_engine.last_timestamp());
+}
+static double age_s(uint64_t last_seen_ns, uint64_t now_ns) {
+    if (last_seen_ns == 0 || last_seen_ns >= now_ns) return 0.0;
+    return (double)(now_ns - last_seen_ns) / 1e9;
+}
+static bool is_stale(double age) { return !g_sat_show_stale && age > g_sat_hide_after_s; }
+// 1.0 while fresh, fading to 0.25 as the entry approaches the hide age.
+static float fresh_alpha(double age) {
+    const double fade_start = std::min(30.0, g_sat_hide_after_s * 0.25);
+    if (age <= fade_start) return 1.0f;
+    const double t = std::min(1.0, (age - fade_start) / std::max(1.0, g_sat_hide_after_s - fade_start));
+    return (float)(1.0 - 0.75 * t);
+}
+static ImU32 with_alpha(ImU32 c, float a) {
+    const ImU32 al = (ImU32)std::clamp((int)(((c >> IM_COL32_A_SHIFT) & 0xFF) * a), 0, 255);
+    return (c & ~IM_COL32_A_MASK) | (al << IM_COL32_A_SHIFT);
+}
+
+// Map view: centre (deg) and scale (degrees per screen pixel, same on both
+// axes for the equirectangular image). g_map_dpp <= 0 means "fit the world".
+double g_map_clon = -80.0, g_map_clat = 45.0;
+double g_map_dpp = 0.0;
+bool g_map_autofit_done = false; // first received positions zoom the view once
+
+static double map_fit_world_dpp(const ImVec2 &size) {
+    return std::max(360.0 / std::max(1.0f, size.x), 180.0 / std::max(1.0f, size.y));
+}
+
+static void map_clamp_view(const ImVec2 &size) {
+    const double world = map_fit_world_dpp(size);
+    const double min_dpp = 0.004; // ~ 250 px per degree: well past image detail
+    if (g_map_dpp <= 0.0 || g_map_dpp > world) g_map_dpp = world;
+    if (g_map_dpp < min_dpp) g_map_dpp = min_dpp;
+    // Keep the centre on the map; when zoomed out further than the world,
+    // centre it.
+    const double half_w = size.x * 0.5 * g_map_dpp, half_h = size.y * 0.5 * g_map_dpp;
+    if (half_w >= 180.0) g_map_clon = 0.0;
+    else g_map_clon = std::clamp(g_map_clon, -180.0 + half_w, 180.0 - half_w);
+    if (half_h >= 90.0) g_map_clat = 0.0;
+    else g_map_clat = std::clamp(g_map_clat, -90.0 + half_h, 90.0 - half_h);
+}
+
+// Zoom to the received satellites and beams with some margin.
+static bool map_fit_to_data(const ImVec2 &size) {
+    double lo_lat = 90, hi_lat = -90, lo_lon = 180, hi_lon = -180;
+    int n = 0;
+    auto add = [&](double lat, double lon) {
+        if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) return;
+        lo_lat = std::min(lo_lat, lat); hi_lat = std::max(hi_lat, lat);
+        lo_lon = std::min(lo_lon, lon); hi_lon = std::max(hi_lon, lon);
+        n++;
+    };
+    const uint64_t now = ring_now_ns();
+    for (const auto &s : g_engine.satellites())
+        if (s.has_pos && !is_stale(age_s(s.last_seen_ns, now))) add(s.lat, s.lon);
+    for (const auto &g : g_engine.ground_beams())
+        if (!is_stale(age_s(g.last_seen_ns, now))) add(g.lat, g.lon);
+    if (n == 0) return false;
+    // At least ~20 x 12 degrees so a single beam isn't absurdly zoomed.
+    double w = std::max(20.0, (hi_lon - lo_lon) * 1.3);
+    double h = std::max(12.0, (hi_lat - lo_lat) * 1.3);
+    g_map_clon = (lo_lon + hi_lon) * 0.5;
+    g_map_clat = (lo_lat + hi_lat) * 0.5;
+    g_map_dpp = std::max(w / std::max(1.0f, size.x), h / std::max(1.0f, size.y));
+    map_clamp_view(size);
+    return true;
+}
+
+// Online satellite imagery over the built-in world image (see ui/map_tiles.h).
+iridi::MapTiles g_tiles;
+bool g_map_online = true;
+// Night mode: NASA Black Marble (Earth at night, city lights) from NASA GIBS,
+// over a darkened day map (which is what shows if those tiles can't load).
+iridi::MapTiles g_tiles_night;
+bool g_map_night = false;
+const ImU32 kNightTint = IM_COL32(70, 82, 120, 255);
+
+// Draw the Esri tiles covering the view, in the map's lat/lon (equirectangular)
+// projection: each Web Mercator tile is drawn as horizontal strips so its
+// latitude scale is right. Tiles still loading show a coarser cached one.
+template <typename LL2S>
+static bool draw_map_tiles(iridi::MapTiles &tiles, ImDrawList *dl, LL2S ll_to_screen, double dpp,
+                           double base_px_per_deg, double vlat_top, double vlon_left, double vlat_bot,
+                           double vlon_right, int zmax = 18, ImU32 tint = IM_COL32_WHITE) {
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr double kMaxLat = 85.0511287798;
+    // Only once zoomed in past the built-in image's own resolution (a
+    // base_px_per_deg of 0 means always: the night layer has no base image).
+    if (dpp <= 0.0 || (base_px_per_deg > 0 && 1.0 / dpp <= base_px_per_deg)) return false;
+    int z = (int)std::ceil(std::log2(360.0 / (256.0 * dpp)));
+    z = std::clamp(z, std::min(3, zmax), zmax);
+    const double top = std::min(vlat_top, kMaxLat), bot = std::max(vlat_bot, -kMaxLat);
+    if (top <= bot) return false;
+    auto merc_y = [&](double lat, int zz) {
+        const double r = lat * kPi / 180.0;
+        return (1.0 - std::asinh(std::tan(r)) / kPi) / 2.0 * (double)(1 << zz);
+    };
+    auto tile_lat = [&](double ty, int zz) {
+        return std::atan(std::sinh(kPi * (1.0 - 2.0 * ty / (double)(1 << zz)))) * 180.0 / kPi;
+    };
+    int x0, x1, y0, y1;
+    for (;;) {
+        const int n = 1 << z;
+        x0 = std::clamp((int)std::floor((std::max(vlon_left, -180.0) + 180.0) / 360.0 * n), 0, n - 1);
+        x1 = std::clamp((int)std::floor((std::min(vlon_right, 180.0) + 180.0) / 360.0 * n), 0, n - 1);
+        y0 = std::clamp((int)std::floor(merc_y(top, z)), 0, n - 1);
+        y1 = std::clamp((int)std::floor(merc_y(bot, z)), 0, n - 1);
+        if ((x1 - x0 + 1) * (y1 - y0 + 1) <= 96 || z <= 3) break;
+        z--;
+    }
+    tiles.begin_frame();
+    const int n = 1 << z;
+    bool any = false;
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            unsigned int tex = tiles.get(z, x, y);
+            int k = 0;
+            // While loading, use the nearest coarser tile already in memory.
+            while (!tex && k < 4 && z - k - 1 >= 0) { k++; tex = tiles.peek(z - k, x >> k, y >> k); }
+            if (!tex) continue;
+            const double f = (double)(1 << k);           // target tiles per texture tile
+            const double u0 = (x - (double)((x >> k) << k)) / f, u1 = u0 + 1.0 / f;
+            const double lon_l = (double)x / n * 360.0 - 180.0, lon_r = (double)(x + 1) / n * 360.0 - 180.0;
+            const int strips = z < 6 ? 16 : 6;
+            for (int i = 0; i < strips; i++) {
+                const double ty0 = y + (double)i / strips, ty1 = y + (double)(i + 1) / strips;
+                const double v0 = (ty0 - (double)((y >> k) << k)) / f, v1 = (ty1 - (double)((y >> k) << k)) / f;
+                const ImVec2 p0 = ll_to_screen(tile_lat(ty0, z), lon_l);
+                const ImVec2 p1 = ll_to_screen(tile_lat(ty1, z), lon_r);
+                dl->AddImage((ImTextureID)(uintptr_t)tex, p0, p1, ImVec2((float)u0, (float)v0),
+                             ImVec2((float)u1, (float)v1), tint);
+            }
+            any = true;
+        }
+    }
+    return any || base_px_per_deg > 0;
+}
+
 void draw_map_window() {
     if (!g_show_map) return;
     ImGui::SetNextWindowSize(ImVec2(900, 500), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Map", &g_show_map)) {
+        // Toolbar
+        bool fit_now = false;
+        if (ImGui::SmallButton("Fit to data")) fit_now = true;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("World")) g_map_dpp = 0.0;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("North America")) {
+            g_map_clon = -95.0; g_map_clat = 45.0; g_map_dpp = -1.0; // sized below
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(110);
+        ImGui::SliderFloat("Hide after", &g_sat_hide_after_s, 30.0f, 900.0f, "%.0f s");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Satellites and spot beams not heard for this long are hidden\n"
+                              "(map and Satellites list). Markers fade as they age.");
+        ImGui::SameLine();
+        ImGui::Checkbox("Show stale", &g_sat_show_stale);
+        ImGui::SameLine();
+        ImGui::Checkbox("Satellite imagery", &g_map_online);
+        ImGui::SameLine();
+        ImGui::Checkbox("Night", &g_map_night);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Night map: NASA Black Marble (the Earth at night, city lights) when\n"
+                              "online (saved in mapcache/ like the day tiles), over a darkened\n"
+                              "day map.");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Sharper imagery as you zoom in (Esri World Imagery, needs internet).\n"
+                              "Tiles you've viewed are kept in mapcache/ and work offline later;\n"
+                              "elsewhere the built-in world image is shown.");
+        ImGui::SameLine();
+        ImGui::TextDisabled("Wheel: zoom   Drag: pan   Double-click: world");
+
         ImVec2 avail = ImGui::GetContentRegionAvail();
         if (avail.x < 16 || avail.y < 16) { ImGui::End(); return; }
-        float aspect = (g_map_h > 0) ? (float)g_map_w / (float)g_map_h : 2.0f;
-        ImVec2 size = avail;
-        if (size.x / size.y > aspect) size.x = size.y * aspect; else size.y = size.x / aspect;
-        ImVec2 pos = ImGui::GetCursorScreenPos();
-        if (g_map_tex) ImGui::Image((ImTextureID)(uintptr_t)g_map_tex, size);
-        else { ImGui::Dummy(size); ImGui::GetWindowDrawList()->AddRectFilled(pos,
-                 ImVec2(pos.x + size.x, pos.y + size.y), IM_COL32(20, 30, 40, 255)); }
-        ImDrawList *dl = ImGui::GetWindowDrawList();
-        ImU32 grid = IM_COL32(255, 255, 255, 40);
-        ImVec2 a;
-        for (int lon = -180; lon <= 180; lon += 30) { project_to_map(0, lon, pos, size, a);
-            dl->AddLine(ImVec2(a.x, pos.y), ImVec2(a.x, pos.y + size.y), grid); }
-        for (int lat = -90; lat <= 90; lat += 30) { project_to_map(lat, 0, pos, size, a);
-            dl->AddLine(ImVec2(pos.x, a.y), ImVec2(pos.x + size.x, a.y), grid); }
-        dl->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y), IM_COL32(255, 255, 255, 90));
+        const ImVec2 pos = ImGui::GetCursorScreenPos();
+        const ImVec2 size = avail;
+        if (g_map_dpp < 0.0) g_map_dpp = std::max(70.0 / size.x, 40.0 / size.y); // NA preset
 
-        // Satellites (from decoded ring alerts / broadcasts).
-        for (const auto &s : g_engine.satellites()) {
-            if (!s.has_pos || s.lat < -90.0 || s.lat > 90.0) continue;
-            ImVec2 pt;
-            project_to_map(s.lat, s.lon, pos, size, pt);
-            dl->AddCircleFilled(pt, 4.0f, IM_COL32(255, 170, 0, 230));
-            dl->AddCircle(pt, 7.0f, IM_COL32(255, 255, 0, 140), 0, 1.5f);
-            char lbl[16];
-            snprintf(lbl, sizeof(lbl), "S%03d", s.id);
-            dl->AddText(ImVec2(pt.x + 7, pt.y - 7), IM_COL32(255, 255, 140, 255), lbl);
+        // Interaction surface
+        ImGui::InvisibleButton("##mapview", size,
+                               ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+        const bool hovered = ImGui::IsItemHovered();
+        ImGuiIO &io = ImGui::GetIO();
+        auto screen_to_ll = [&](const ImVec2 &p, double &lat, double &lon) {
+            lon = g_map_clon + (p.x - (pos.x + size.x * 0.5)) * g_map_dpp;
+            lat = g_map_clat - (p.y - (pos.y + size.y * 0.5)) * g_map_dpp;
+        };
+        map_clamp_view(size);
+        if (hovered && io.MouseWheel != 0.0f) {
+            // Zoom about the cursor so the point under it stays put.
+            double mlat, mlon;
+            screen_to_ll(io.MousePos, mlat, mlon);
+            g_map_dpp *= std::pow(1.25, -io.MouseWheel);
+            map_clamp_view(size);
+            double nlat, nlon;
+            screen_to_ll(io.MousePos, nlat, nlon);
+            g_map_clon += mlon - nlon;
+            g_map_clat += mlat - nlat;
+            map_clamp_view(size);
         }
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
+            g_map_clon -= io.MouseDelta.x * g_map_dpp;
+            g_map_clat += io.MouseDelta.y * g_map_dpp;
+            map_clamp_view(size);
+        }
+        if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) g_map_dpp = 0.0;
+        if (fit_now) map_fit_to_data(size);
+        if (!g_map_autofit_done && map_fit_to_data(size)) g_map_autofit_done = true;
+        map_clamp_view(size);
+
+        auto ll_to_screen = [&](double lat, double lon) {
+            return ImVec2((float)(pos.x + size.x * 0.5 + (lon - g_map_clon) / g_map_dpp),
+                          (float)(pos.y + size.y * 0.5 - (lat - g_map_clat) / g_map_dpp));
+        };
+
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        const ImVec2 pmax(pos.x + size.x, pos.y + size.y);
+        dl->PushClipRect(pos, pmax, true);
+        dl->AddRectFilled(pos, pmax, IM_COL32(12, 18, 26, 255));
+        const ImVec2 w0 = ll_to_screen(90.0, -180.0), w1 = ll_to_screen(-90.0, 180.0);
+        const ImU32 day_tint = g_map_night ? kNightTint : IM_COL32_WHITE;
+        if (g_map_tex) dl->AddImage((ImTextureID)(uintptr_t)g_map_tex, w0, w1, ImVec2(0, 0), ImVec2(1, 1), day_tint);
+        else dl->AddRectFilled(w0, w1, IM_COL32(20, 30, 40, 255));
+        bool tiles_drawn = false, night_drawn = false;
+        if (g_map_online) {
+            double t_top, t_left, t_bot, t_right;
+            screen_to_ll(pos, t_top, t_left);
+            screen_to_ll(pmax, t_bot, t_right);
+            const double base_ppd = g_map_tex && g_map_w > 0 ? g_map_w / 360.0 : 0.0;
+            tiles_drawn = draw_map_tiles(g_tiles, dl, ll_to_screen, g_map_dpp, base_ppd, t_top, t_left, t_bot,
+                                         t_right, 18, day_tint);
+            // Black Marble goes up to zoom 8 (~500 m); closer in it's enlarged.
+            if (g_map_night)
+                night_drawn = draw_map_tiles(g_tiles_night, dl, ll_to_screen, g_map_dpp, 0.0, t_top, t_left,
+                                             t_bot, t_right, 8);
+        }
+
+        // Grid: finer and labelled as you zoom in.
+        const double span = size.x * g_map_dpp;
+        const int step = span > 150 ? 30 : span > 60 ? 10 : span > 25 ? 5 : span > 8 ? 2 : 1;
+        const ImU32 grid = IM_COL32(255, 255, 255, 40), glabel = IM_COL32(230, 230, 230, 170);
+        double vlat_top, vlon_left, vlat_bot, vlon_right;
+        screen_to_ll(pos, vlat_top, vlon_left);
+        screen_to_ll(pmax, vlat_bot, vlon_right);
+        char gl[16];
+        for (int lon = -180; lon <= 180; lon += step) {
+            if (lon < vlon_left - step || lon > vlon_right + step) continue;
+            ImVec2 a = ll_to_screen(0, lon);
+            dl->AddLine(ImVec2(a.x, std::max(pos.y, w0.y)), ImVec2(a.x, std::min(pmax.y, w1.y)), grid);
+            if (step < 30 && a.x > pos.x + 4 && a.x < pmax.x - 30) {
+                snprintf(gl, sizeof(gl), "%d%c", std::abs(lon), lon < 0 ? 'W' : (lon > 0 ? 'E' : ' '));
+                dl->AddText(ImVec2(a.x + 2, pos.y + 2), glabel, gl);
+            }
+        }
+        for (int lat = -90; lat <= 90; lat += step) {
+            if (lat < vlat_bot - step || lat > vlat_top + step) continue;
+            ImVec2 a = ll_to_screen(lat, 0);
+            dl->AddLine(ImVec2(std::max(pos.x, w0.x), a.y), ImVec2(std::min(pmax.x, w1.x), a.y), grid);
+            if (step < 30 && a.y > pos.y + 16 && a.y < pmax.y - 24) {
+                snprintf(gl, sizeof(gl), "%d%c", std::abs(lat), lat < 0 ? 'S' : (lat > 0 ? 'N' : ' '));
+                dl->AddText(ImVec2(pos.x + 2, a.y + 1), glabel, gl);
+            }
+        }
+
+        // Markers, plus the one nearest the cursor for a tooltip.
+        const ImVec2 mouse = io.MousePos;
+        float best_d2 = 10.0f * 10.0f;
+        std::string tip;
+        auto consider = [&](const ImVec2 &pt, const std::string &text) {
+            const float dx = pt.x - mouse.x, dy = pt.y - mouse.y, d2 = dx * dx + dy * dy;
+            if (hovered && d2 < best_d2) { best_d2 = d2; tip = text; }
+        };
+        char tb[160];
         // Ground spot-beam centers (ring alerts with alt < 100 km).
+        const uint64_t now_ns = ring_now_ns();
         for (const auto &g : g_engine.ground_beams()) {
             if (g.lat < -90.0 || g.lat > 90.0) continue;
-            ImVec2 pt;
-            project_to_map(g.lat, g.lon, pos, size, pt);
-            dl->AddCircleFilled(pt, 2.5f, IM_COL32(0, 210, 255, 190));
+            const double age = age_s(g.last_seen_ns, now_ns);
+            if (is_stale(age)) continue;
+            const float fa = fresh_alpha(age);
+            const ImVec2 pt = ll_to_screen(g.lat, g.lon);
+            dl->AddCircleFilled(pt, 3.0f, with_alpha(IM_COL32(0, 210, 255, 200), fa));
             if (g.pages > 0)
-                dl->AddCircle(pt, 6.5f, IM_COL32(255, 60, 220, 230), 0, 1.5f);
+                dl->AddCircle(pt, 7.0f, with_alpha(IM_COL32(255, 60, 220, 230), fa), 0, 1.5f);
+            snprintf(tb, sizeof(tb), "Beam %d of S%03d\n%+.3f, %+.3f\nRing alerts: %d   Pages: %d\nLast heard %.0f s ago",
+                     g.beam, g.sat, g.lat, g.lon, g.count, g.pages, age);
+            consider(pt, tb);
         }
+        // Satellites (from decoded ring alerts).
+        for (const auto &s : g_engine.satellites()) {
+            if (!s.has_pos || s.lat < -90.0 || s.lat > 90.0) continue;
+            const double age = age_s(s.last_seen_ns, now_ns);
+            if (is_stale(age)) continue;
+            const float fa = fresh_alpha(age);
+            const ImVec2 pt = ll_to_screen(s.lat, s.lon);
+            dl->AddCircleFilled(pt, 4.5f, with_alpha(IM_COL32(255, 170, 0, 235), fa));
+            dl->AddCircle(pt, 8.0f, with_alpha(IM_COL32(255, 255, 0, 150), fa), 0, 1.5f);
+            char lbl[16];
+            snprintf(lbl, sizeof(lbl), "S%03d", s.id);
+            dl->AddText(ImVec2(pt.x + 8, pt.y - 8), with_alpha(IM_COL32(255, 255, 140, 255), fa), lbl);
+            snprintf(tb, sizeof(tb), "Satellite %03d\n%+.3f, %+.3f   %d km\nBeam %d   Hits %d\nLast heard %.0f s ago",
+                     s.id, s.lat, s.lon, s.alt_km, s.beam, s.count, age);
+            consider(pt, tb);
+        }
+
         if (!g_map_tex) {
             const char *msg = "Map image unavailable";
             ImVec2 ts = ImGui::CalcTextSize(msg);
-            dl->AddText(ImVec2(pos.x + (size.x - ts.x) * 0.5f,
-                               pos.y + (size.y - ts.y) * 0.5f),
+            dl->AddText(ImVec2(pos.x + (size.x - ts.x) * 0.5f, pos.y + (size.y - ts.y) * 0.5f),
                         IM_COL32(235, 235, 235, 240), msg);
-            const char *hint =
-                "Place worldmap.jpg in an assets folder next to IridiScope.exe";
+            const char *hint = "Place worldmap.jpg in an assets folder next to IridiScope.exe";
             ImVec2 hs = ImGui::CalcTextSize(hint);
-            dl->AddText(ImVec2(pos.x + (size.x - hs.x) * 0.5f,
-                               pos.y + (size.y - hs.y) * 0.5f + 22),
+            dl->AddText(ImVec2(pos.x + (size.x - hs.x) * 0.5f, pos.y + (size.y - hs.y) * 0.5f + 22),
                         IM_COL32(160, 185, 205, 220), hint);
         }
-        dl->AddText(ImVec2(pos.x + 8, pos.y + size.y - 20),
-                    IM_COL32(255, 255, 255, 190),
-                    "orange = satellite   cyan = spot beam   magenta = paging");
+        // Imagery credit (required by Esri) while tiles are in use.
+        if (tiles_drawn || night_drawn) {
+            char cred[160];
+            if (night_drawn)
+                snprintf(cred, sizeof(cred), "Night imagery: NASA Black Marble (GIBS)%s",
+                         g_tiles_night.offline() ? "  (offline: showing saved tiles)" : "");
+            else
+                snprintf(cred, sizeof(cred), "Imagery: Esri, Maxar, Earthstar Geographics%s",
+                         g_tiles.offline() ? "  (offline: showing saved tiles)" : "");
+            const ImVec2 cs = ImGui::CalcTextSize(cred);
+            dl->AddRectFilled(ImVec2(pmax.x - cs.x - 12, pmax.y - 22), ImVec2(pmax.x - 4, pmax.y - 4),
+                              IM_COL32(0, 0, 0, 140));
+            dl->AddText(ImVec2(pmax.x - cs.x - 8, pmax.y - 20), IM_COL32(255, 255, 255, 190), cred);
+        }
+        // Legend and cursor position
+        const char *legend = "orange = satellite   cyan = spot beam   magenta = paging";
+        dl->AddRectFilled(ImVec2(pos.x + 4, pmax.y - 22),
+                          ImVec2(pos.x + 12 + ImGui::CalcTextSize(legend).x, pmax.y - 4),
+                          IM_COL32(0, 0, 0, 140));
+        dl->AddText(ImVec2(pos.x + 8, pmax.y - 20), IM_COL32(255, 255, 255, 200), legend);
+        if (hovered) {
+            double mlat, mlon;
+            screen_to_ll(mouse, mlat, mlon);
+            if (mlat >= -90 && mlat <= 90 && mlon >= -180 && mlon <= 180) {
+                char cp[48];
+                snprintf(cp, sizeof(cp), "%+.3f, %+.3f", mlat, mlon);
+                const ImVec2 cs = ImGui::CalcTextSize(cp);
+                dl->AddRectFilled(ImVec2(pmax.x - cs.x - 12, pmax.y - 22), ImVec2(pmax.x - 4, pmax.y - 4),
+                                  IM_COL32(0, 0, 0, 140));
+                dl->AddText(ImVec2(pmax.x - cs.x - 8, pmax.y - 20), IM_COL32(255, 255, 255, 200), cp);
+            }
+        }
+        dl->PopClipRect();
+        if (!tip.empty()) ImGui::SetTooltip("%s", tip.c_str());
     }
     ImGui::End();
 }
@@ -1091,9 +1667,19 @@ void draw_satellites_window() {
     if (!g_show_sats) return;
     ImGui::SetNextWindowSize(ImVec2(420, 240), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Satellites", &g_show_sats)) {
-        auto sats = g_engine.satellites();
-        ImGui::TextDisabled("%zu satellites", sats.size());
-        if (ImGui::BeginTable("sats", 6,
+        auto all = g_engine.satellites();
+        const uint64_t now_ns = ring_now_ns();
+        std::vector<iridi::Satellite> sats;
+        for (const auto &s : all)
+            if (!is_stale(age_s(s.last_seen_ns, now_ns))) sats.push_back(s);
+        std::sort(sats.begin(), sats.end(), [](const iridi::Satellite &a, const iridi::Satellite &b) {
+            return a.last_seen_ns > b.last_seen_ns;
+        });
+        ImGui::TextDisabled("%zu satellites heard in the last %.0f s (%zu total)", sats.size(),
+                            g_sat_hide_after_s, all.size());
+        ImGui::SameLine();
+        ImGui::Checkbox("Show stale", &g_sat_show_stale);
+        if (ImGui::BeginTable("sats", 7,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
                 ImVec2(0, 0))) {
             ImGui::TableSetupScrollFreeze(0, 1);
@@ -1103,6 +1689,7 @@ void draw_satellites_window() {
             ImGui::TableSetupColumn("Alt km");
             ImGui::TableSetupColumn("Beam");
             ImGui::TableSetupColumn("Hits");
+            ImGui::TableSetupColumn("Age s");
             ImGui::TableHeadersRow();
             for (const auto &s : sats) {
                 ImGui::TableNextRow();
@@ -1115,9 +1702,97 @@ void draw_satellites_window() {
                 if (s.has_pos) ImGui::Text("%d", s.alt_km); else ImGui::TextUnformatted("-");
                 ImGui::TableSetColumnIndex(4); ImGui::Text("%d", s.beam);
                 ImGui::TableSetColumnIndex(5); ImGui::Text("%d", s.count);
+                ImGui::TableSetColumnIndex(6); ImGui::Text("%.0f", age_s(s.last_seen_ns, now_ns));
             }
             ImGui::EndTable();
         }
+    }
+    ImGui::End();
+}
+
+void draw_log_window() {
+    if (!g_show_log) return;
+    ImGui::SetNextWindowSize(ImVec2(820, 240), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Log", &g_show_log)) {
+        static bool paused = false;
+        static bool follow = true;
+        static std::vector<std::string> frozen;
+        static char filter[96] = "";
+        static std::vector<std::string> cache;
+        static uint64_t cache_ver = ~0ull;
+        if (!paused) {
+            std::lock_guard<std::mutex> lk(g_log_mtx);
+            if (cache_ver != g_log_version) { cache = g_log; cache_ver = g_log_version; }
+        }
+        const std::vector<std::string> &lines = paused ? frozen : cache;
+        if (ImGui::Button(paused ? "Resume" : "Pause")) {
+            paused = !paused;
+            if (paused) { std::lock_guard<std::mutex> lk(g_log_mtx); frozen = g_log; }
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(220);
+        ImGui::InputTextWithHint("##logfilter", "Filter (e.g. Airspy, 1626.27)", filter, sizeof(filter));
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear filter")) filter[0] = 0;
+        std::string needle(filter);
+        for (auto &ch : needle) ch = (char)std::tolower((unsigned char)ch);
+        std::vector<const std::string *> shown;
+        for (const auto &l : lines) {
+            if (!needle.empty()) {
+                std::string hay = l;
+                for (auto &ch : hay) ch = (char)std::tolower((unsigned char)ch);
+                if (hay.find(needle) == std::string::npos) continue;
+            }
+            if (!g_log_cat[log_category(l)]) continue;
+            shown.push_back(&l);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy shown")) {
+            std::string out;
+            for (const auto *l : shown) { out += *l; out += "\n"; }
+            ImGui::SetClipboardText(out.c_str());
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox("Auto-scroll", &follow);
+        {
+            static const char *names[6] = {"Status", "Alerts", "Radio", "Voice", "Handoffs", "Other"};
+            static const char *tips[6] = {
+                "Summary every interval: frames, bursts, CPU, memory, drops, noise floor, traffic.",
+                "Problems: sample drops, skipped bursts, CPU starved, frame rate or noise floor jumps,\nWAV write failures.",
+                "Radio and settings: start/stop, gain changes, sweeps, IQ recording, priority/wideband toggles.",
+                "Every saved call: length, speech, frequency, handoffs, announcement, file.",
+                "Handoff tracking detail on voice calls (followed / not followed).",
+                "Everything else (startup, map, sorting, ...)."};
+            ImGui::TextDisabled("Show:");
+            for (int i = 0; i < 6; i++) {
+                ImGui::SameLine();
+                ImGui::Checkbox(names[i], &g_log_cat[i]);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tips[i]);
+            }
+            ImGui::SameLine();
+            static const char *iv[3] = {"30 s", "1 min", "5 min"};
+            ImGui::SetNextItemWidth(70);
+            ImGui::Combo("Status every", &g_status_interval_idx, iv, 3);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%zu lines%s   (also saved to iridiscope.log)", shown.size(), paused ? " (paused)" : "");
+        ImGui::BeginChild("##logscroll", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+        ImGuiListClipper clip;
+        clip.Begin((int)shown.size());
+        while (clip.Step())
+            for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+                const std::string &l = *shown[(size_t)i];
+                const int cat = log_category(l);
+                const bool warn = cat == 1 || l.find("ERROR") != std::string::npos || l.find("not followed") != std::string::npos;
+                if (warn) ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "%s", l.c_str());
+                else if (cat == 0) ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%s", l.c_str());
+                else if (cat == 3) ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s", l.c_str());
+                else if (cat == 4) ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.7f, 1.0f), "%s", l.c_str());
+                else ImGui::TextUnformatted(l.c_str());
+            }
+        if (follow && !paused && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 20.0f)
+            ImGui::SetScrollHereY(1.0f);
+        ImGui::EndChild();
     }
     ImGui::End();
 }
@@ -1126,8 +1801,51 @@ void draw_messages_window() {
     if (!g_show_messages) return;
     ImGui::SetNextWindowSize(ImVec2(820, 280), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Messages", &g_show_messages)) {
-        auto msgs = g_engine.recent_messages(1000);
-        ImGui::TextDisabled("%zu recent parsed messages", msgs.size());
+        // Pause freezes a snapshot; the filter matches type or detail text
+        // (case-insensitive) across the last 4000 messages.
+        static bool paused = false;
+        static std::vector<irid::ParsedMessage> frozen;
+        static char filter[96] = "";
+        if (ImGui::Button(paused ? "Resume" : "Pause")) {
+            paused = !paused;
+            if (paused) frozen = g_engine.recent_messages(4000);
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(220);
+        ImGui::InputTextWithHint("##msgfilter", "Filter (e.g. handoff_resp, IRA, VOC)", filter, sizeof(filter));
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear")) filter[0] = 0;
+        static std::vector<irid::ParsedMessage> live;
+        static auto last_fetch = std::chrono::steady_clock::time_point{};
+        if (!paused && std::chrono::steady_clock::now() - last_fetch > std::chrono::milliseconds(250)) {
+            live = g_engine.recent_messages(4000);
+            last_fetch = std::chrono::steady_clock::now();
+        }
+        const std::vector<irid::ParsedMessage> &src = paused ? frozen : live;
+        std::string needle(filter);
+        for (auto &ch : needle) ch = (char)std::tolower((unsigned char)ch);
+        std::vector<const irid::ParsedMessage *> shown;
+        for (auto it = src.rbegin(); it != src.rend(); ++it) {
+            if (!needle.empty()) {
+                std::string hay = it->type + " " + it->pretty;
+                for (auto &ch : hay) ch = (char)std::tolower((unsigned char)ch);
+                if (hay.find(needle) == std::string::npos) continue;
+            }
+            shown.push_back(&*it);
+            if (needle.empty() && shown.size() >= 1000) break;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy shown")) {
+            std::string out;
+            for (size_t i = 0; i < shown.size() && i < 500; i++) {
+                char fb[32]; snprintf(fb, sizeof(fb), "%.0f", shown[i]->frequency);
+                out += shown[i]->type + "\t" + fb + "\t" + shown[i]->pretty + "\n";
+            }
+            ImGui::SetClipboardText(out.c_str());
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy the listed rows (up to 500) to the clipboard");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%zu shown%s", shown.size(), paused ? "  (paused)" : "");
         if (ImGui::BeginTable("msgs", 4,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
                 ImVec2(0, 0))) {
@@ -1137,8 +1855,11 @@ void draw_messages_window() {
             ImGui::TableSetupColumn("Sat", ImGuiTableColumnFlags_WidthFixed, 40);
             ImGui::TableSetupColumn("Detail", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableHeadersRow();
-            for (auto it = msgs.rbegin(); it != msgs.rend(); ++it) {
-                const auto &m = *it;
+            ImGuiListClipper clip;
+            clip.Begin((int)shown.size());
+            while (clip.Step())
+            for (int row = clip.DisplayStart; row < clip.DisplayEnd; ++row) {
+                const auto &m = *shown[(size_t)row];
                 ImGui::TableNextRow();
                 ImVec4 col = m.error ? ImVec4(0.6f, 0.6f, 0.6f, 1.0f)
                     : (m.type == "IRA" ? ImVec4(1.0f, 0.8f, 0.3f, 1.0f)
@@ -1159,6 +1880,53 @@ void draw_messages_window() {
 }
 
 void draw_playback_contents() {
+    {
+        static const char *labels[] = {"1 s", "2 s", "4 s", "8 s"};
+        ImGui::SetNextItemWidth(90);
+        ImGui::Combo("Decoder backlog (live)", &g_backlog_idx, labels, 4);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("How far the decoders may fall behind the radio during a traffic peak.\n"
+                              "Beyond that the oldest bursts are skipped; the radio itself is never\n"
+                              "interrupted. Memory: about 80 MB per second at 10 Msps.\n"
+                              "Applies the next time the radio starts.");
+        static const char *glabels[] = {"1 GB", "2 GB", "4 GB", "8 GB"};
+        ImGui::SetNextItemWidth(90);
+        ImGui::Combo("Playback queue memory", &g_queue_budget_idx, glabels, 4);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Playing a recording: memory for bursts waiting for the decoders\n"
+                              "(nothing is skipped; playback slows down instead). Applies on Play.");
+    }
+    if (ImGui::Checkbox("Protect radio from other programs", &g_protect_radio)) {
+        add_log("[RADIO] Protect radio from other programs: %s", g_protect_radio ? "on" : "off");
+        iridi_set_boost(g_protect_radio);
+        iridi_apply_thread_priority(IRIDI_PRIO_NORMAL);   // this (UI) thread
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Runs IridiScope at 'above normal' Windows priority so the threads that move\n"
+                          "samples from the radio (USB, conversion, burst detector) outrank any normal\n"
+                          "program, e.g. 7-Zip or a game. Decoders, UI and saving are lowered by the\n"
+                          "same step, so they still share the CPU equally with other programs.\n"
+                          "Takes effect immediately.");
+    if (ImGui::Checkbox("Ignore wideband carriers", &g_reject_wide)) {
+        ir_set_reject_wide(g_reject_wide);
+        add_log("[RADIO] Ignore wideband carriers: %s", g_reject_wide ? "on" : "off");
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Drop detections that sit inside a signal 150 kHz or wider (about 200 kHz\n"
+                          "carriers seen around 1619-1622 and 1625-1626 MHz). The classic Iridium\n"
+                          "decoders can't read them; each one otherwise reaches the decoders as\n"
+                          "several failed bursts. When on, bursts/s counts only what is decoded.\n"
+                          "Takes effect immediately.");
+    {
+        bool uw = irid::irid_uw_ec.load();
+        if (ImGui::Checkbox("Sync tolerance (recover damaged frames)", &uw)) irid::irid_uw_ec.store(uw);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Accept frames whose 12-symbol sync pattern (unique word) has up to 3\n"
+                              "wrong symbols, as iridium-toolkit's --uw-ec does. Recovers frames that\n"
+                              "would otherwise be 'Access code missing'. Chance of a random burst\n"
+                              "passing is ~0.08%%, and later checks reject most of those.\n"
+                              "Applies immediately.");
+    }
     bool running = g_engine.running();
     if (!running) {
         ImGui::BeginDisabled(!active_source()->is_open());
@@ -1186,8 +1954,372 @@ void draw_playback_contents() {
     if (s.done) ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "Done");
 }
 
+// Rolling 10-second rates for Stats: good (error-free) frames per second and
+// the share of radio samples dropped because processing fell behind.
+struct RateSample { std::chrono::steady_clock::time_point t; uint64_t good, rx, dropped, drv; };
+static std::deque<RateSample> g_rate_hist;
+static float g_good_hist[120];   // last 60 s of good frames/s, 0.5 s apart (sparkline)
+static float g_burst_hist[120];  // same for bursts/s
+static int g_good_hist_n = 0;
+static double g_peak_good = 0, g_peak_bursts = 0;           // session peaks (10 s averages)
+static std::chrono::system_clock::time_point g_peak_good_t;
+
+// Car-style tachometer: 270 degree dial, ticks and numbers, a damped needle,
+// a peak-hold marker and a big digital readout. The scale only ever steps
+// up (so the dial doesn't jump around) when the value or peak outgrows it.
+static void draw_gauge(const char *id, const char *label, double value, double peak, float &scale,
+                       float width, ImU32 accent) {
+    static const float steps[] = {50, 100, 150, 200, 300, 400, 500, 600, 800, 1000, 1500, 2000, 3000, 4000, 6000};
+    const float need = (float)std::max(value, peak) * 1.08f;
+    if (need > scale) for (float st : steps) if (st >= need) { scale = st; break; }
+    const float h = width * 0.80f;
+    ImGui::PushID(id);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##g", ImVec2(width, h));
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const ImVec2 c(p0.x + width * 0.5f, p0.y + width * 0.47f);
+    const float r = width * 0.43f;
+    const float a0 = 3.14159265f * 0.75f, a1 = 3.14159265f * 2.25f;   // 135..405 degrees
+    auto ang = [&](double v) { return a0 + (a1 - a0) * (float)std::clamp(v / scale, 0.0, 1.0); };
+    auto pt = [&](float a, float rr) { return ImVec2(c.x + std::cos(a) * rr, c.y + std::sin(a) * rr); };
+    // Face and track.
+    dl->AddCircleFilled(c, r * 1.12f, IM_COL32(18, 20, 26, 255), 64);
+    dl->AddCircle(c, r * 1.12f, IM_COL32(70, 76, 90, 255), 64, 1.5f);
+    dl->PathArcTo(c, r, a0, a1, 64);
+    dl->PathStroke(IM_COL32(45, 50, 62, 255), 0, r * 0.10f);
+    // Damped needle (eases toward the value, like a real gauge).
+    ImGuiStorage *st = ImGui::GetStateStorage();
+    float *disp = st->GetFloatRef(ImGui::GetID("needle"), (float)value);
+    *disp += ((float)value - *disp) * std::min(1.0f, ImGui::GetIO().DeltaTime * 4.0f);
+    // Lit arc up to the needle.
+    if (*disp > 0) {
+        dl->PathArcTo(c, r, a0, ang(*disp), 48);
+        dl->PathStroke(accent, 0, r * 0.10f);
+    }
+    // Ticks: 10 major with numbers, 4 minor between.
+    const float fs = ImGui::GetFontSize();
+    for (int i = 0; i <= 50; i++) {
+        const float a = a0 + (a1 - a0) * i / 50.0f;
+        const bool major = i % 5 == 0;
+        const bool red = i >= 43;   // the "redline" top of the dial
+        const ImU32 col = red ? IM_COL32(230, 70, 60, 255) : IM_COL32(200, 205, 215, 255);
+        dl->AddLine(pt(a, r * (major ? 0.78f : 0.84f)), pt(a, r * 0.90f), col, major ? 2.0f : 1.0f);
+        if (major && i % 10 == 0) {
+            char t[16]; snprintf(t, sizeof(t), "%.0f", scale * i / 50.0f);
+            const float tfs = fs * 0.78f;
+            const ImVec2 ts = ImGui::GetFont()->CalcTextSizeA(tfs, FLT_MAX, 0, t);
+            const ImVec2 q = pt(a, r * 0.62f);
+            dl->AddText(ImGui::GetFont(), tfs, ImVec2(q.x - ts.x * 0.5f, q.y - ts.y * 0.5f),
+                        IM_COL32(170, 176, 190, 255), t);
+        }
+    }
+    // Peak-hold marker.
+    if (peak > 0) {
+        const float ap = ang(peak);
+        dl->AddTriangleFilled(pt(ap, r * 1.06f), pt(ap - 0.06f, r * 1.17f), pt(ap + 0.06f, r * 1.17f),
+                              IM_COL32(255, 80, 70, 255));
+    }
+    // Needle.
+    const float an = ang(*disp);
+    const ImVec2 tip = pt(an, r * 0.95f), back = pt(an + 3.14159265f, r * 0.14f);
+    const ImVec2 side(std::cos(an + 1.5708f) * r * 0.035f, std::sin(an + 1.5708f) * r * 0.035f);
+    dl->AddTriangleFilled(tip, ImVec2(back.x + side.x, back.y + side.y), ImVec2(back.x - side.x, back.y - side.y),
+                          IM_COL32(255, 96, 64, 255));
+    dl->AddCircleFilled(c, r * 0.09f, IM_COL32(60, 64, 76, 255), 24);
+    dl->AddCircleFilled(c, r * 0.05f, IM_COL32(200, 205, 215, 255), 16);
+    // Digital readout and label.
+    char vb[24]; snprintf(vb, sizeof(vb), "%.0f", std::max(0.0, value));
+    const float big = fs * 1.9f;
+    ImVec2 vs = ImGui::GetFont()->CalcTextSizeA(big, FLT_MAX, 0, vb);
+    dl->AddText(ImGui::GetFont(), big, ImVec2(c.x - vs.x * 0.5f, c.y + r * 0.30f), accent, vb);
+    ImVec2 ls = ImGui::GetFont()->CalcTextSizeA(fs * 0.85f, FLT_MAX, 0, label);
+    dl->AddText(ImGui::GetFont(), fs * 0.85f, ImVec2(c.x - ls.x * 0.5f, c.y + r * 0.30f + big),
+                IM_COL32(170, 176, 190, 255), label);
+    if (peak > 0) {
+        char pb[32]; snprintf(pb, sizeof(pb), "peak %.0f", peak);
+        ImVec2 ps = ImGui::GetFont()->CalcTextSizeA(fs * 0.78f, FLT_MAX, 0, pb);
+        dl->AddText(ImGui::GetFont(), fs * 0.78f, ImVec2(c.x - ps.x * 0.5f, c.y - r * 0.42f),
+                    IM_COL32(255, 110, 95, 255), pb);
+    }
+    ImGui::PopID();
+}
+
+static const iridi::LiveIqSource *active_live_source() {
+    return g_source_kind == 1 ? &g_sdr : g_source_kind == 2 ? &g_hackrf
+         : g_source_kind == 3 ? &g_airspy : g_source_kind == 4 ? &g_rtlsdr : nullptr;
+}
+
+// Recent-activity tracking for the drop / queue-full rows in Stats. Updated
+// every frame (even with Stats collapsed) so "last" times stay accurate:
+// the rows show the last 60 s and when it last happened; totals since Start
+// are in the tooltips.
+struct EvTrack {
+    struct Snap { std::chrono::steady_clock::time_point t; uint64_t app, drv, qf, sk; };
+    std::deque<Snap> hist;
+    std::chrono::system_clock::time_point last_app, last_drv, last_qf;
+    bool have_app = false, have_drv = false, have_qf = false;
+    uint64_t win_app = 0, win_drv = 0, win_qf = 0;
+};
+static EvTrack g_ev;
+static uint64_t g_skip_60 = 0;   // bursts skipped in the last 60 s
+static void update_event_tracking() {
+    uint64_t app = 0, drv = 0, qf = g_engine.queue_full_count(), sk = g_engine.skipped_bursts();
+    if (const iridi::LiveIqSource *lv = active_live_source()) {
+        app = lv->dropped_samples();
+        if (lv->reports_driver_drops()) drv = lv->driver_dropped_samples();
+    }
+    auto &h = g_ev.hist;
+    const auto tnow = std::chrono::steady_clock::now();
+    if (!h.empty() && (app < h.back().app || drv < h.back().drv || qf < h.back().qf || sk < h.back().sk)) {
+        h.clear(); g_ev.have_app = g_ev.have_drv = g_ev.have_qf = false;   // counters restarted
+    }
+    if (!h.empty()) {
+        const auto wall = std::chrono::system_clock::now();
+        if (app > h.back().app) { g_ev.last_app = wall; g_ev.have_app = true; }
+        if (drv > h.back().drv) { g_ev.last_drv = wall; g_ev.have_drv = true; }
+        if (qf > h.back().qf)   { g_ev.last_qf = wall;  g_ev.have_qf = true; }
+    }
+    if (h.empty() || tnow - h.back().t >= std::chrono::milliseconds(250)) h.push_back({tnow, app, drv, qf, sk});
+    else { h.back().app = app; h.back().drv = drv; h.back().qf = qf; h.back().sk = sk; }
+    while (h.size() > 1 && tnow - h[1].t >= std::chrono::seconds(60)) h.pop_front();
+    g_ev.win_app = app - h.front().app; g_ev.win_drv = drv - h.front().drv; g_ev.win_qf = qf - h.front().qf;
+    g_skip_60 = sk - h.front().sk;
+}
+
+// Detector load (% of real time spent detecting; >100% means it can't keep
+// up) and detected bursts per second, both over the last ~10 s.
+struct LoadSample { std::chrono::steady_clock::time_point t; uint64_t busy, wait, cpu, samples, bursts, reused, fresh, wide; };
+static std::deque<LoadSample> g_load_hist;
+static double g_det_load = -1.0, g_bursts_ps = -1.0, g_det_wait = -1.0, g_det_cpu = -1.0;
+static double g_fresh_ps = -1.0, g_reused_pct = -1.0;   // burst buffers, last ~10 s
+static double g_wide_ps = -1.0;                         // wide-carrier detections dropped/s
+static size_t g_buf_live = 0, g_buf_idle = 0;           // burst buffer memory now
+static void update_detector_load() {
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t busy = g_engine.detector_busy_ns(), smp = g_engine.detector_samples();
+    const uint64_t wait = g_engine.detector_wait_ns(), cpu = g_engine.detector_cpu_ns();
+    const uint64_t bursts = g_engine.stats().bursts;
+    uint64_t reused = 0, fresh = 0;
+    ir_pipeline_buffer_stats(&reused, &fresh, &g_buf_live, &g_buf_idle);
+    if (!g_load_hist.empty() && (smp < g_load_hist.back().samples || bursts < g_load_hist.back().bursts))
+        g_load_hist.clear();
+    if (g_load_hist.empty() || now - g_load_hist.back().t >= std::chrono::milliseconds(250))
+        g_load_hist.push_back({now, busy, wait, cpu, smp, bursts, reused, fresh, ir_wide_dropped()});
+    while (g_load_hist.size() > 2 && now - g_load_hist[1].t >= std::chrono::seconds(10)) g_load_hist.pop_front();
+    g_det_load = g_bursts_ps = g_det_wait = g_det_cpu = g_fresh_ps = g_reused_pct = g_wide_ps = -1.0;
+    if (g_load_hist.size() < 2 || !g_engine.running()) return;
+    const auto &a = g_load_hist.front(), &b = g_load_hist.back();
+    const double rate = active_source()->sample_rate();
+    const double dt = std::chrono::duration<double>(b.t - a.t).count();
+    if (rate > 0 && b.samples > a.samples) {
+        const double sig = (b.samples - a.samples) / rate;
+        g_det_load = 100.0 * ((b.busy - a.busy) / 1e9) / sig;
+        g_det_wait = 100.0 * ((b.wait - a.wait) / 1e9) / sig;
+        g_det_cpu = 100.0 * ((b.cpu - a.cpu) / 1e9) / sig;
+    }
+    if (dt > 0.5) {
+        g_bursts_ps = (b.bursts - a.bursts) / dt;
+        g_wide_ps = b.wide >= a.wide ? (b.wide - a.wide) / dt : 0.0;
+        const uint64_t r = b.reused - a.reused, f = b.fresh - a.fresh;
+        g_fresh_ps = f / dt;
+        if (r + f > 0) g_reused_pct = 100.0 * r / (double)(r + f);
+    }
+}
+
 void draw_stats_contents() {
     iridi::EngineStats s = g_engine.stats();
+    double good_rate = -1.0, drop_pct = -1.0, drv_pct = -1.0;
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t parsed = g_engine.parsed_count(), errs = g_engine.parse_error_count();
+        const uint64_t good = parsed - std::min(parsed, errs);
+        const auto *live = active_live_source();
+        const uint64_t rx = live ? live->received_samples() : 0, dr = live ? live->dropped_samples() : 0;
+        const uint64_t drv = live ? live->driver_dropped_samples() : 0;
+        // Restarted (counters went backwards)? Start the history again.
+        if (!g_rate_hist.empty() && (good < g_rate_hist.back().good || rx < g_rate_hist.back().rx)) {
+            g_rate_hist.clear(); g_good_hist_n = 0; g_peak_good = g_peak_bursts = 0;
+        }
+        if (g_rate_hist.empty() || now - g_rate_hist.back().t >= std::chrono::milliseconds(500)) {
+            g_rate_hist.push_back({now, good, rx, dr, drv});
+            while (g_rate_hist.size() > 2 && now - g_rate_hist[1].t >= std::chrono::seconds(10))
+                g_rate_hist.pop_front();
+            if (g_rate_hist.size() >= 2) {
+                const auto &a = g_rate_hist.front();
+                const double dt = std::chrono::duration<double>(now - a.t).count();
+                if (dt > 0.9 && s.running) {
+                    const float v = (float)((good - a.good) / dt);
+                    const float bv = (float)std::max(0.0, g_bursts_ps);
+                    if (g_good_hist_n < 120) { g_burst_hist[g_good_hist_n] = bv; g_good_hist[g_good_hist_n++] = v; }
+                    else {
+                        std::memmove(g_good_hist, g_good_hist + 1, sizeof(float) * 119); g_good_hist[119] = v;
+                        std::memmove(g_burst_hist, g_burst_hist + 1, sizeof(float) * 119); g_burst_hist[119] = bv;
+                    }
+                }
+            }
+        }
+        if (g_rate_hist.size() >= 2 && s.running) {
+            const auto &a = g_rate_hist.front();
+            const double dt = std::chrono::duration<double>(now - a.t).count();
+            if (dt > 0.9) {
+                good_rate = (good - a.good) / dt;
+                if (live && rx > a.rx) drop_pct = 100.0 * (double)(dr - a.dropped) / (double)(rx - a.rx);
+                if (live && live->reports_driver_drops() && rx > a.rx) {
+                    const double d = (double)(drv - std::min(drv, a.drv));
+                    drv_pct = 100.0 * d / ((double)(rx - a.rx) + d);
+                }
+            }
+        }
+    }
+    // Headline: two tachometers (good frames/s and bursts/s), the 60 s trend,
+    // a one-line health check and the session's highlights. All the detailed
+    // counters are under "Details".
+    if (good_rate >= 0) {
+        if (good_rate > g_peak_good) { g_peak_good = good_rate; g_peak_good_t = std::chrono::system_clock::now(); }
+        if (g_bursts_ps > g_peak_bursts) g_peak_bursts = g_bursts_ps;
+        static float scale_good = 200, scale_bursts = 1000;
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const float gw = std::min(220.0f, (avail - ImGui::GetStyle().ItemSpacing.x) * 0.5f);
+        const float indent = std::max(0.0f, (avail - 2 * gw - ImGui::GetStyle().ItemSpacing.x) * 0.5f);
+        if (indent > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
+        draw_gauge("good", "GOOD FRAMES/s", good_rate, g_peak_good, scale_good, gw, IM_COL32(90, 230, 120, 255));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Frames decoded without errors per second (10 s average).\nRed marker: session peak.");
+        ImGui::SameLine();
+        draw_gauge("bursts", "BURSTS/s", std::max(0.0, g_bursts_ps), g_peak_bursts, scale_bursts, gw,
+                   IM_COL32(90, 180, 255, 255));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Bursts the detector finds per second (10 s average): everything above\n"
+                              "the noise, including what doesn't decode. Red marker: session peak.");
+        if (g_good_hist_n > 1) {
+            float mx = 1.0f;
+            for (int i = 0; i < g_good_hist_n; i++) mx = std::max(mx, g_good_hist[i]);
+            ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(0.35f, 0.9f, 0.47f, 1.0f));
+            ImGui::PlotLines("##goodspark", g_good_hist, g_good_hist_n, 0, "good frames/s, last 60 s", 0.0f,
+                             mx * 1.1f, ImVec2(-1, 40));
+            ImGui::PopStyleColor();
+            float mb = 1.0f;
+            for (int i = 0; i < g_good_hist_n; i++) mb = std::max(mb, g_burst_hist[i]);
+            ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(0.35f, 0.7f, 1.0f, 1.0f));
+            ImGui::PlotLines("##burstspark", g_burst_hist, g_good_hist_n, 0, "bursts/s, last 60 s", 0.0f,
+                             mb * 1.1f, ImVec2(-1, 28));
+            ImGui::PopStyleColor();
+        }
+        // Health: one line, green when nothing was lost in the last 60 s.
+        {
+            const iridi::LiveIqSource *live = active_live_source();
+            const double sr = live && live->sample_rate() > 0 ? (double)live->sample_rate() : 1.0;
+            const double lost_ms = 1000.0 * (double)(g_ev.win_app + g_ev.win_drv) / sr;
+            if (lost_ms > 0 || g_skip_60 > 0) {
+                ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "Last 60 s: %.0f ms of radio lost, %llu bursts skipped",
+                                   lost_ms, (unsigned long long)g_skip_60);
+            } else {
+                ImGui::TextColored(ImVec4(0.45f, 1.0f, 0.55f, 1.0f), "Healthy");
+                ImGui::SameLine();
+                ImGui::TextDisabled("nothing lost in the last 60 s");
+            }
+            if (g_det_load >= 0) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("  detector %.0f%%", g_det_load);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Detector: share of real time the burst detector needs (under 100%% keeps up).\n"
+                                  "Radio lost = samples dropped by IridiScope or the Airspy driver.\n"
+                                  "Skipped = bursts the decoders let go because they were more than the\n"
+                                  "Decoder backlog behind. Details below.");
+        }
+    } else {
+        ImGui::TextDisabled("Good frames/s: (start a source)");
+    }
+    // Session highlights.
+    if (ImGui::BeginTable("highlights", 2, ImGuiTableFlags_None)) {
+        ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthStretch);
+        auto hrow = [](const char *k, const char *v, ImVec4 col = ImVec4(1, 1, 1, 1)) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("%s", k);
+            ImGui::TableSetColumnIndex(1); ImGui::TextColored(col, "%s", v);
+        };
+        char b[128];
+        const uint64_t parsed = g_engine.parsed_count(), perr = g_engine.parse_error_count();
+        const uint64_t good = parsed - std::min(parsed, perr);
+        auto grp = [](uint64_t v, char *out, size_t n) {   // 1234567 -> 1,234,567
+            char t[32]; snprintf(t, sizeof(t), "%llu", (unsigned long long)v);
+            const int len = (int)strlen(t); int o = 0;
+            for (int i = 0; i < len && o < (int)n - 1; i++) { out[o++] = t[i]; if ((len - i - 1) % 3 == 0 && i < len - 1 && o < (int)n - 1) out[o++] = ','; }
+            out[o] = 0;
+        };
+        char g1[40]; grp(good, g1, sizeof(g1));
+        snprintf(b, sizeof(b), "%s", g1);
+        hrow("Frames decoded", b, ImVec4(0.45f, 1.0f, 0.55f, 1.0f));
+        if (g_peak_good > 0) {
+            std::time_t tt = std::chrono::system_clock::to_time_t(g_peak_good_t);
+            std::tm lt{};
+#ifdef _WIN32
+            localtime_s(&lt, &tt);
+#else
+            localtime_r(&tt, &lt);
+#endif
+            snprintf(b, sizeof(b), "%.0f good frames/s at %02d:%02d", g_peak_good, lt.tm_hour, lt.tm_min);
+            hrow("Session peak", b);
+        }
+        {
+            const auto all = g_engine.satellites();
+            const uint64_t now_ns = ring_now_ns();
+            size_t now_n = 0;
+            for (const auto &sv : all) if (age_s(sv.last_seen_ns, now_ns) <= g_sat_hide_after_s) now_n++;
+            snprintf(b, sizeof(b), "%zu now, %zu since start", now_n, all.size());
+            hrow("Satellites", b);
+        }
+        {
+            const auto &vm = g_engine.voices();
+            const double tot = vm.speech_total_s();
+            snprintf(b, sizeof(b), "%llu with speech (%d:%02d)", (unsigned long long)vm.speech_calls(),
+                     (int)(tot / 60), (int)tot % 60);
+            hrow("Voice calls", b);
+            if (vm.longest_speech_s() > 0) {
+                snprintf(b, sizeof(b), "%.0f s of speech", vm.longest_speech_s());
+                hrow("Longest call", b);
+            }
+            snprintf(b, sizeof(b), "%llu of %llu followed", (unsigned long long)vm.handoffs_followed(),
+                     (unsigned long long)vm.handoffs_seen());
+            hrow("Handoffs", b);
+            if (g_source_kind != 0) {
+                snprintf(b, sizeof(b), "%llu voice frames", (unsigned long long)g_engine.voice_recovered());
+                hrow("Recovered", b);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Weak voice frames decoded by targeting each call's next burst.");
+            }
+        }
+        {
+            const auto &ac = g_engine.acars();
+            snprintf(b, sizeof(b), "ACARS %llu  pager %llu  SMS %llu  SBD %llu",
+                     (unsigned long long)ac.acars_count(), (unsigned long long)g_engine.pager().count(),
+                     (unsigned long long)ac.sms_count(), (unsigned long long)ac.sbd_message_count());
+            hrow("Messages", b);
+        }
+        {
+            const int el = (int)s.elapsed_s;
+            snprintf(b, sizeof(b), "%d:%02d:%02d", el / 3600, (el / 60) % 60, el % 60);
+            hrow("Running", b);
+        }
+        ImGui::EndTable();
+    }
+    uint64_t win_app = g_ev.win_app, win_drv = g_ev.win_drv, win_qf = g_ev.win_qf;
+    const bool have_app = g_ev.have_app, have_drv = g_ev.have_drv, have_qf = g_ev.have_qf;
+    const auto last_app = g_ev.last_app, last_drv = g_ev.last_drv, last_qf = g_ev.last_qf;
+    auto ago = [](bool have, std::chrono::system_clock::time_point t, char *out, size_t n) {
+        if (!have) { snprintf(out, n, "never"); return; }
+        std::time_t tt = std::chrono::system_clock::to_time_t(t);
+        std::tm lt{};
+#ifdef _WIN32
+        localtime_s(&lt, &tt);
+#else
+        localtime_r(&tt, &lt);
+#endif
+        snprintf(out, n, "%02d:%02d:%02d", lt.tm_hour, lt.tm_min, lt.tm_sec);
+    };
+    if (!ImGui::TreeNode("Details")) return;
     if (ImGui::BeginTable("stats", 2, ImGuiTableFlags_SizingStretchProp)) {
         auto row = [](const char *k, const char *v) {
             ImGui::TableNextRow();
@@ -1200,12 +2332,135 @@ void draw_stats_contents() {
         snprintf(b, sizeof(b), "%llu", (unsigned long long)s.frames_fail); row("Frames failed", b);
         snprintf(b, sizeof(b), "%llu", (unsigned long long)g_engine.parsed_count()); row("Parsed frames", b);
         snprintf(b, sizeof(b), "%llu", (unsigned long long)g_engine.parse_error_count()); row("Parse errors", b);
-        snprintf(b, sizeof(b), "%zu", g_engine.satellites().size());       row("Satellites", b);
+        {
+            const auto all = g_engine.satellites();
+            const uint64_t now_ns = ring_now_ns();
+            size_t now_n = 0;
+            for (const auto &sv : all) if (age_s(sv.last_seen_ns, now_ns) <= g_sat_hide_after_s) now_n++;
+            snprintf(b, sizeof(b), "%zu now / %zu since start", now_n, all.size());
+            row("Satellites", b);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("'now' = heard in the last %.0f s (the map's Hide after setting).", g_sat_hide_after_s);
+        }
+        {
+            const iridi::LiveIqSource *live = active_live_source();
+            if (live) {
+                const uint64_t rx = live->received_samples(), dr = live->dropped_samples();
+                const double sr = live->sample_rate() > 0 ? (double)live->sample_rate() : 1.0;
+                // One row per drop source: last 60 s (as signal time) + when it
+                // last happened; the hover tooltip has the totals since Start.
+                auto drop_row = [&](const char *label, uint64_t win, uint64_t total, double total_pct,
+                                    bool have, std::chrono::system_clock::time_point last, const char *what) {
+                    char when[16]; ago(have, last, when, sizeof(when));
+                    char v[96];
+                    snprintf(v, sizeof(v), "%.0f ms   (last: %s)", 1000.0 * (double)win / sr, when);
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(label);
+                    const bool hov0 = ImGui::IsItemHovered();
+                    ImGui::TableSetColumnIndex(1);
+                    if (win) ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "%s", v);
+                    else ImGui::TextUnformatted(v);
+                    if (hov0 || ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s\nShown: signal lost in the last 60 s, and when a drop last happened.\n"
+                                          "Since Start: %llu samples = %.1f s (%.3f%%)",
+                                          what, (unsigned long long)total, (double)total / sr, total_pct);
+                };
+                drop_row("Dropped, app (60 s)", win_app, dr, rx ? 100.0 * dr / rx : 0.0, have_app, last_app,
+                         "Samples IridiScope discarded because decoding fell behind the radio.");
+                if (live->reports_driver_drops()) {
+                    const uint64_t dd = live->driver_dropped_samples();
+                    drop_row("Dropped, driver (60 s)", win_drv, dd, (rx + dd) ? 100.0 * dd / (double)(rx + dd) : 0.0,
+                             have_drv, last_drv,
+                             "Samples the Airspy driver discarded before IridiScope got them\n"
+                             "(its USB conversion thread fell behind).");
+                }
+                if (live->buffer_seconds() > 0) {
+                    snprintf(b, sizeof(b), "%.2f s", live->buffer_seconds());
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("Sample buffer");
+                    ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(b);
+                }
+            }
+        }
+        {
+            const uint64_t rec = g_engine.uw_recovered(), tf = g_engine.uw_tolerated_failed();
+            const uint64_t good = g_engine.parsed_count() - std::min(g_engine.parsed_count(), g_engine.parse_error_count());
+            snprintf(b, sizeof(b), "%llu (%.1f%% of good)", (unsigned long long)rec, good ? 100.0 * rec / good : 0.0);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("Recovered by sync tolerance");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Good frames that only parsed because the sync pattern had 1-3 wrong\n"
+                                  "symbols. Without the option these would be 'Access code missing'.\n"
+                                  "(%llu more were accepted on sync but failed later checks.)",
+                                  (unsigned long long)tf);
+            ImGui::TableSetColumnIndex(1);
+            if (irid::irid_uw_ec.load()) ImGui::TextUnformatted(b); else ImGui::TextDisabled("off");
+        }
+        if (g_engine.worker_threads() > 0 && g_source_kind != 0) {
+            snprintf(b, sizeof(b), "%d  (backlog %.0f s)", g_engine.worker_threads(),
+                     kBacklogS[std::clamp(g_backlog_idx, 0, 3)]);
+            row("Decoder worker threads", b);
+        }
+        if (g_engine.running()) {
+            if (!g_reject_wide) snprintf(b, sizeof(b), "off");
+            else if (g_wide_ps >= 0) snprintf(b, sizeof(b), "%.0f /s  (%llu total)", g_wide_ps, (unsigned long long)ir_wide_dropped());
+            else snprintf(b, sizeof(b), "%llu total", (unsigned long long)ir_wide_dropped());
+            row("Wideband carrier detections ignored", b);
+        }
+        if (g_engine.worker_threads() > 0 && g_source_kind == 0) {
+            snprintf(b, sizeof(b), "%d  (queue %d bursts)", g_engine.worker_threads(), g_engine.queue_capacity());
+            row("Decoder worker threads", b);
+            const uint64_t qf = g_engine.queue_full_count();
+            char when[16]; ago(have_qf, last_qf, when, sizeof(when));
+            snprintf(b, sizeof(b), "%llu   (last: %s)", (unsigned long long)win_qf, when);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("Queue-full waits (60 s)");
+            const bool hov0 = ImGui::IsItemHovered();
+            ImGui::TableSetColumnIndex(1);
+            if (win_qf) ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "%s", b);
+            else ImGui::TextUnformatted(b);
+            if (hov0 || ImGui::IsItemHovered())
+                ImGui::SetTooltip("Bursts that had to wait in the last 60 s because the burst queue was full\n"
+                                  "(every decoder worker busy). Short bursts of waits are absorbed by the\n"
+                                  "sample buffer; sustained waits stall the detector and samples drop.\n"
+                                  "Since Start: %llu", (unsigned long long)qf);
+        }
+        if (g_source_kind != 0 && g_engine.running()) {
+            const uint64_t sk = g_engine.skipped_bursts();
+            snprintf(b, sizeof(b), "%llu   (since start: %llu)", (unsigned long long)g_skip_60, (unsigned long long)sk);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("Bursts skipped (60 s)");
+            const bool hov1 = ImGui::IsItemHovered();
+            ImGui::TableSetColumnIndex(1);
+            if (g_skip_60) ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "%s", b);
+            else ImGui::TextUnformatted(b);
+            if (hov1 || ImGui::IsItemHovered())
+                ImGui::SetTooltip("Bursts the decoders skipped because they were further behind the radio\n"
+                                  "than the Decoder backlog setting (a traffic peak bigger than the CPU).\n"
+                                  "The radio itself keeps flowing; only the oldest bursts are skipped.");
+        }
+        if (g_source_kind != 0 && g_engine.running()) {
+            snprintf(b, sizeof(b), "%llu   (%llu targeted reads)", (unsigned long long)g_engine.voice_recovered(),
+                     (unsigned long long)g_engine.targeted_reads());
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("Voice frames recovered");
+            const bool hov2 = ImGui::IsItemHovered();
+            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(b);
+            if (hov2 || ImGui::IsItemHovered())
+                ImGui::SetTooltip("Voice frames decoded by reading a call's next burst at its exact time and\n"
+                                  "frequency, where the detector found nothing (burst too weak to trigger it).\n"
+                                  "Silent stretches of a call have no bursts, so most reads find none.");
+        }
+        snprintf(b, sizeof(b), "%llu", (unsigned long long)g_engine.voices().handoffs_seen());
+        row("Handoff resp. (on calls)", b);
+        snprintf(b, sizeof(b), "%llu", (unsigned long long)g_engine.voices().handoffs_followed());
+        row("Handoffs followed", b);
         snprintf(b, sizeof(b), "%.1f s", s.elapsed_s);                     row("Elapsed", b);
         snprintf(b, sizeof(b), "%s", s.running ? (s.paused ? "paused" : "running") : "stopped");
         row("State", b);
         ImGui::EndTable();
     }
+    ImGui::TreePop();
 }
 
 void draw_spectrum_controls() {
@@ -1956,21 +3211,144 @@ void update_autoplay() {
     for (const auto &c : calls) {
         if (c.active || c.id <= g_autoplay_last_id) continue;
         g_autoplay_last_id = c.id;
-        if (g_autoplay) g_autoplay_queue.push_back(c.id);
+        if (g_autoplay && (!g_voice_hide_failed || (c.error_ratio <= g_voice_max_err && c.speech_s >= 1.0)) &&
+            (!g_voice_hide_short || c.duration_s >= g_voice_min_s))
+            g_autoplay_queue.push_back(c.id);
     }
     if (!g_autoplay) {
         g_autoplay_queue.clear();
         return;
     }
+    // Wait for a saved call's announcement check before playing it, and skip
+    // announcements while they're hidden.
+    while (!g_audio.playing() && !g_autoplay_queue.empty()) {
+        const int qid = g_autoplay_queue.front();
+        bool wait = false, skip = false;
+        for (const auto &c : calls)
+            if (c.id == qid) {
+                if (!c.wav_path.empty() && !c.classified) wait = true;
+                if (g_voice_hide_ann && !c.announcement.empty()) skip = true;
+            }
+        if (wait) break;
+        if (skip) { g_autoplay_queue.pop_front(); continue; }
+        break;
+    }
     if (!g_audio.playing() && !g_autoplay_queue.empty()) {
+        bool pending = false;
+        for (const auto &c : calls)
+            if (c.id == g_autoplay_queue.front() && !c.wav_path.empty() && !c.classified) pending = true;
+        if (pending) return;
         int id = g_autoplay_queue.front();
         g_autoplay_queue.pop_front();
         auto pcm = g_engine.voices().pcm(id);
         if (!pcm.empty()) {
             g_audio.play(pcm, 8000);
+            g_audio_call_id = id;
             add_log("Auto play: voice call #%d (%.1f s)", id, pcm.size() / 8000.0);
         }
     }
+}
+
+// Transcript of the selected call, under its waveform.
+static void draw_call_transcript(const iridi::VoiceCall &c) {
+    auto &tx = stt::Transcriber::instance();
+    if (c.tx_state == 2) {
+        ImGui::TextDisabled("Transcript (%s)", c.language.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy##tx")) {
+            std::string s = c.transcript;
+            if (!c.transcript_en.empty()) s += "\n\nEnglish:\n" + c.transcript_en;
+            ImGui::SetClipboardText(s.c_str());
+        }
+        const float h = ImGui::GetTextLineHeightWithSpacing() * (c.transcript_en.empty() ? 4.5f : 7.5f);
+        ImGui::BeginChild("##txtext", ImVec2(0, h), true);
+        ImGui::TextWrapped("%s", c.transcript.c_str());
+        if (!c.transcript_en.empty()) {
+            ImGui::Spacing();
+            ImGui::TextDisabled("English:");
+            ImGui::TextWrapped("%s", c.transcript_en.c_str());
+        }
+        ImGui::EndChild();
+    } else if (c.tx_state == 1) {
+        ImGui::TextDisabled(tx.busy_id() == c.id ? "Transcribing..." : "Queued for transcription (%d waiting)", tx.queued());
+    } else if (c.tx_state == 3) {
+        ImGui::TextDisabled("Transcript: no speech found");
+    } else if (!c.active && !c.wav_path.empty() && c.announcement.empty()) {
+        if (!g_stt_on || tx.model_state(0) != stt::ModelState::Ready) {
+            ImGui::TextDisabled("No transcript.");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Set up transcription...")) g_show_stt = true;
+        } else if (ImGui::SmallButton(c.tx_state == 4 ? "Transcribe again" : "Transcribe")) {
+            g_engine.voices().request_transcript(c.id);
+        }
+    }
+}
+
+// View > Transcription: models, options.
+static void draw_transcription_window() {
+    if (!g_show_stt) return;
+    ImGui::SetNextWindowSize(ImVec2(560, 420), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Transcription", &g_show_stt)) {
+        auto &tx = stt::Transcriber::instance();
+        if (!stt::Transcriber::available()) {
+            ImGui::TextWrapped("This build doesn't include speech-to-text: whisper.cpp wasn't found when it was "
+                               "compiled. See the build notes for how to add it.");
+            ImGui::End();
+            return;
+        }
+        ImGui::TextWrapped("Saved voice calls are turned into text on this PC (whisper.cpp; nothing is sent "
+                           "anywhere). It runs after each call ends at the lowest priority, so it never takes "
+                           "CPU from the radio or the decoders. The text is shown in the Voice tab, saved next "
+                           "to the WAV as a .txt and in the message database.");
+        ImGui::Separator();
+        static const char *names[2] = {"Small model (every call, detects language)",
+                                       "Large-v3-turbo (re-does non-English calls, optional)"};
+        for (int m = 0; m < 2; m++) {
+            ImGui::PushID(m);
+            ImGui::TextUnformatted(names[m]);
+            const stt::ModelState st = tx.model_state(m);
+            if (st == stt::ModelState::Ready) {
+                ImGui::SameLine(); ImGui::TextColored(ImVec4(0.5f, 1, 0.5f, 1), "ready");
+            } else if (st == stt::ModelState::Downloading) {
+                char b[48]; snprintf(b, sizeof(b), "%.0f of %.0f MB", tx.download_progress(m) * tx.model_size_mb(m), tx.model_size_mb(m));
+                ImGui::ProgressBar(tx.download_progress(m), ImVec2(260, 0), b);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Cancel")) tx.cancel_download(m);
+            } else {
+                char b[48]; snprintf(b, sizeof(b), "Download (%.0f MB)", tx.model_size_mb(m));
+                if (ImGui::Button(b)) tx.download(m);
+                if (st == stt::ModelState::Failed) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1, .6f, .4f, 1), "failed - see Log"); }
+            }
+            ImGui::PopID();
+        }
+        ImGui::Separator();
+        const bool ready = tx.model_state(0) == stt::ModelState::Ready;
+        if (!ready) ImGui::BeginDisabled();
+        if (ImGui::Checkbox("Transcribe saved calls", &g_stt_on)) {
+            tx.set_enabled(g_stt_on);
+            add_log("[VOICE] Transcription: %s", g_stt_on ? "on" : "off");
+        }
+        if (!ready) { ImGui::EndDisabled(); ImGui::SameLine(); ImGui::TextDisabled("(download the small model first)"); }
+        if (ImGui::Checkbox("Use the large model for all calls", &g_stt_large_all)) tx.set_large_for_all(g_stt_large_all);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("More accurate (names, accents, choppy audio) but about 3-4x slower and\n"
+                              "~1 GB more memory while working. Needs the large model; without it every\n"
+                              "call uses the small one. Off: large only re-does non-English calls.");
+        if (ImGui::Checkbox("Translate non-English calls to English", &g_stt_translate)) tx.set_translate(g_stt_translate);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Adds an English version under the original text. Uses the large model if\n"
+                              "downloaded. Treat translations as rough: on choppy audio Whisper can\n"
+                              "invent sentences when translating.");
+        ImGui::TextDisabled("Words to expect (names, jargon; English calls only):");
+        if (ImGui::InputTextMultiline("##vocab", g_stt_vocab, sizeof(g_stt_vocab), ImVec2(-1, ImGui::GetTextLineHeight() * 4)))
+            tx.set_vocabulary(g_stt_vocab);
+        ImGui::Separator();
+        const int busy = tx.busy_id();
+        if (busy >= 0) ImGui::Text("Transcribing call #%d, %d waiting", busy, tx.queued());
+        else ImGui::TextDisabled("Idle, %d waiting", tx.queued());
+        ImGui::TextDisabled("Models are stored in the models folder next to IridiScope.exe.");
+    }
+    ImGui::End();
 }
 
 void draw_voice_window() {
@@ -1979,9 +3357,69 @@ void draw_voice_window() {
     if (ImGui::Begin("Voice", &g_show_voice)) {
         auto calls = g_engine.voices().calls();
         int active = 0; for (auto &c : calls) if (c.active) active++;
-        ImGui::TextDisabled("%zu voice calls (%d active)  [%s]", calls.size(), active,
-                            g_audio.playing() ? "playing" : "idle");
+        // Finished calls above the error threshold are hidden unless asked for;
+        // in-progress calls stay visible since their error ratio is still settling.
+        auto hidden = [](const iridi::VoiceCall &c) {
+            if (c.active) return false;
+            if (g_voice_hide_failed && c.error_ratio > g_voice_max_err) return true;
+            if (g_voice_hide_failed && c.speech_s < 1.0) return true;   // silence updates only
+            if (g_voice_hide_ann && !c.announcement.empty()) return true;
+            if (g_voice_hide_short && c.duration_s < g_voice_min_s) return true;
+            return false;
+        };
+        int nHidden = 0; for (auto &c : calls) if (hidden(c)) nHidden++;
+        ImGui::TextDisabled("%zu voice calls (%d active, %d hidden)  [%s]", calls.size(), active,
+                            nHidden, g_audio.playing() ? "playing" : "idle");
         ImGui::SameLine();
+        ImGui::Checkbox("Hide failed", &g_voice_hide_failed);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Hide finished calls whose Err is above the threshold, and calls with\n"
+                              "under 1 s of speech (only the network's once-a-second silence\n"
+                              "updates: the person on this side never spoke).");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!g_voice_hide_failed);
+        ImGui::SetNextItemWidth(90);
+        ImGui::SliderFloat("Max Err", &g_voice_max_err, 0.05f, 1.0f, "%.2f");
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::Checkbox("Hide <", &g_voice_hide_short);
+        ImGui::SameLine(0, 4);
+        ImGui::BeginDisabled(!g_voice_hide_short);
+        ImGui::SetNextItemWidth(56);
+        ImGui::DragFloat("s##minlen", &g_voice_min_s, 0.1f, 0.0f, 120.0f, "%.1f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Hide finished calls shorter than this many seconds (drag, or\n"
+                              "double-click to type). Autoplay skips them too.");
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::Checkbox("Hide announcements", &g_voice_hide_ann);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Hide calls that are only a recorded network announcement (\"The subscriber\n"
+                              "cannot be reached...\", \"...911, 112 or 000...\"). Their WAVs go to\n"
+                              "recordings\\announcements\\<name>\\. Reference recordings: assets\\announcements\\\n"
+                              "(add a WAV there to recognise another announcement). %d loaded.",
+                              iridi::AnnouncementMatcher::instance().templates());
+        ImGui::SameLine();
+        {
+            bool fh = g_engine.voices().follow_handoffs();
+            if (ImGui::Checkbox("Follow handoffs", &fh)) g_engine.voices().set_follow_handoffs(fh);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Keep a call together when the network hands it to a new\n"
+                                  "channel (beam/satellite handoff). Uses the handoff response\n"
+                                  "sent on the call's own channel, as iridium-toolkit's\n"
+                                  "voc-cluster.py does. HO column = handoffs followed.\n"
+                                  "Applies to new calls; only works if the new channel is\n"
+                                  "inside the receiver's bandwidth.");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Hide finished calls shorter than 1 second\n"
+                              "(fragments from handoffs or brief bursts).");
+        ImGui::SameLine();
+        if (g_audio.playing()) {
+            if (ImGui::Button(g_audio.paused() ? "Resume##aud" : "Pause##aud"))
+                g_audio.paused() ? g_audio.resume() : g_audio.pause();
+            ImGui::SameLine();
+        }
         if (ImGui::Button("Stop audio")) g_audio.stop();
         ImGui::SameLine();
         ImGui::Checkbox("Auto play", &g_autoplay);
@@ -1994,67 +3432,263 @@ void draw_voice_window() {
             g_audio.set_volume(vol);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Calls are peak-normalised, then amplified by this amount");
-        if (ImGui::BeginTable("calls", 7,
-                ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
-                ImVec2(0, 140))) {
+        // Local start time of a call, for the Time column.
+        auto hhmmss = [](uint64_t ns, char *out, size_t n) {
+            const std::time_t t = (std::time_t)(ns / 1000000000ULL);
+            std::tm lt{};
+#ifdef _WIN32
+            if (localtime_s(&lt, &t) != 0) { snprintf(out, n, "-"); return; }
+#else
+            if (!localtime_r(&t, &lt)) { snprintf(out, n, "-"); return; }
+#endif
+            std::strftime(out, n, "%H:%M:%S", &lt);
+        };
+        auto select_row = [](int id) {
+            if (g_selected_voice != id) { g_selected_voice = id; g_voice_cache_id = -1; }
+        };
+
+        // In-progress calls get their own small table, so calls starting and
+        // ending never shift the list of finished recordings.
+        std::vector<iridi::VoiceCall> act, fin;
+        for (auto &c : calls) {
+            if (c.active) act.push_back(c);
+            else if (!hidden(c)) fin.push_back(c);
+        }
+        std::sort(act.begin(), act.end(), [](const auto &x, const auto &y) { return x.start_ns > y.start_ns; });
+        ImGui::TextDisabled("Active (%zu)", act.size());
+        if (ImGui::BeginTable("active_calls", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+                                                 ImGuiTableFlags_ScrollY,
+                              ImVec2(0, ImGui::GetTextLineHeightWithSpacing() * 4.6f))) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 46);
+            ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 52);
+            ImGui::TableSetupColumn("Started", ImGuiTableColumnFlags_WidthFixed, 70);
             ImGui::TableSetupColumn("MHz", ImGuiTableColumnFlags_WidthFixed, 88);
-            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 52);
             ImGui::TableSetupColumn("Dur s", ImGuiTableColumnFlags_WidthFixed, 56);
-            ImGui::TableSetupColumn("Frames", ImGuiTableColumnFlags_WidthFixed, 56);
             ImGui::TableSetupColumn("Err", ImGuiTableColumnFlags_WidthFixed, 50);
-            ImGui::TableSetupColumn("State");
+            ImGui::TableSetupColumn("HO");
             ImGui::TableHeadersRow();
-            for (auto it = calls.rbegin(); it != calls.rend(); ++it) {
-                const auto &cv = *it;
+            for (const auto &cv : act) {
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
-                char lbl[32]; snprintf(lbl, sizeof(lbl), "#%d", cv.id);
-                if (ImGui::Selectable(lbl, g_selected_voice == cv.id, ImGuiSelectableFlags_SpanAllColumns)) {
-                    g_selected_voice = cv.id; g_voice_cache_id = -1;
-                }
-                ImGui::TableSetColumnIndex(1); ImGui::Text("%.4f", cv.channel_hz / 1e6);
-                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(cv.subtype.c_str());
+                char lbl[32]; snprintf(lbl, sizeof(lbl), "#%d##a", cv.id);
+                if (ImGui::Selectable(lbl, g_selected_voice == cv.id, ImGuiSelectableFlags_SpanAllColumns))
+                    select_row(cv.id);
+                char tb[16]; hhmmss(cv.start_ns, tb, sizeof(tb));
+                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(tb);
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%.4f", cv.channel_hz / 1e6);
                 ImGui::TableSetColumnIndex(3); ImGui::Text("%.1f", cv.duration_s);
-                ImGui::TableSetColumnIndex(4); ImGui::Text("%d", cv.frames);
-                ImGui::TableSetColumnIndex(5); ImGui::Text("%.2f", cv.error_ratio);
-                ImGui::TableSetColumnIndex(6);
-                ImGui::TextColored(cv.error_ratio < 0.5f ? ImVec4(0.5f, 1, 0.5f, 1)
-                                                         : ImVec4(0.9f, 0.7f, 0.4f, 1),
-                                   "%s", cv.active ? "active" : "done");
+                ImGui::TableSetColumnIndex(4); ImGui::Text("%.2f", cv.error_ratio);
+                ImGui::TableSetColumnIndex(5);
+                if (cv.handoffs > 0) ImGui::Text("%d", cv.handoffs); else ImGui::TextDisabled("-");
             }
             ImGui::EndTable();
         }
+
+        // Player for the selected call: controls, then its waveform, above the
+        // finished list.
         if (g_selected_voice >= 0) {
-            if (g_voice_cache_id != g_selected_voice) {
+            static auto cache_t = std::chrono::steady_clock::now();
+            const auto tnow = std::chrono::steady_clock::now();
+            bool sel_active = false;
+            for (auto &c : calls) if (c.id == g_selected_voice && c.active) sel_active = true;
+            // An in-progress call keeps growing: refresh its audio once a second.
+            if (g_voice_cache_id != g_selected_voice || (sel_active && tnow - cache_t > std::chrono::seconds(1))) {
                 g_voice_cache = g_engine.voices().pcm(g_selected_voice);
                 g_voice_cache_id = g_selected_voice;
+                cache_t = tnow;
             }
             if (!g_voice_cache.empty()) {
-                ImGui::Text("Call #%d  (%zu samples, %.1f s)", g_selected_voice,
-                            g_voice_cache.size(), g_voice_cache.size() / 8000.0);
-                if (ImGui::Button("Play")) g_audio.play(g_voice_cache, 8000);
+                // Play -> Pause -> Resume for the selected call; Stop resets.
+                const bool sel_loaded = g_audio.playing() && g_audio_call_id == g_selected_voice;
+                const char *pl = !sel_loaded ? "Play##selp" : g_audio.paused() ? "Resume##selp" : "Pause##selp";
+                if (ImGui::Button(pl)) {
+                    if (!sel_loaded) { g_audio.play(g_voice_cache, 8000); g_audio_call_id = g_selected_voice; }
+                    else if (g_audio.paused()) g_audio.resume();
+                    else g_audio.pause();
+                }
                 ImGui::SameLine();
                 if (ImGui::Button("Stop")) g_audio.stop();
-                if (ImPlot::BeginPlot("##wave", ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
-                    const auto &pcm = g_voice_cache;
-                    int n = (int)pcm.size();
-                    int step = std::max(1, n / 4000);
-                    std::vector<float> xs, ys;
-                    xs.reserve(n / step + 1); ys.reserve(n / step + 1);
-                    for (int i = 0; i < n; i += step) {
-                        xs.push_back((float)i / 8000.0f);
-                        ys.push_back(pcm[i] / 32768.0f);
+                ImGui::SameLine();
+                ImGui::Text("Call #%d  %.1f s", g_selected_voice, g_voice_cache.size() / 8000.0);
+                // Waveform: mirrored peak envelope, one bar per pixel, scaled to
+                // the call's own loudest moment so quiet calls are visible too,
+                // with a cursor while it plays.
+                const float wh = ImGui::GetFrameHeight() * 3.2f;
+                const float ww = ImGui::GetContentRegionAvail().x;
+                const ImVec2 p0 = ImGui::GetCursorScreenPos();
+                const bool wclick = ImGui::InvisibleButton("##selwave", ImVec2(std::max(1.0f, ww), wh));
+                ImDrawList *wdl = ImGui::GetWindowDrawList();
+                const ImVec2 p1(p0.x + ww, p0.y + wh);
+                wdl->AddRectFilled(p0, p1, IM_COL32(16, 20, 28, 255), 3.0f);
+                const float mid = p0.y + wh * 0.5f;
+                wdl->AddLine(ImVec2(p0.x, mid), ImVec2(p1.x, mid), IM_COL32(60, 70, 90, 255));
+                const auto &pcm = g_voice_cache;
+                const int n = (int)pcm.size();
+                int peak = 1;
+                for (int16_t v : pcm) peak = std::max(peak, std::abs((int)v));
+                const float scale = (wh * 0.48f) / (float)std::max(peak, 1500);
+                const int cols = std::max(1, (int)ww);
+                for (int c = 0; c < cols; c++) {
+                    const int i0 = (int)((long long)c * n / cols), i1 = (int)((long long)(c + 1) * n / cols);
+                    int pk = 0;
+                    for (int k = i0; k < i1 && k < n; k++) pk = std::max(pk, std::abs((int)pcm[k]));
+                    if (pk < 2) continue;
+                    const float hgt = std::max(1.0f, pk * scale);
+                    wdl->AddLine(ImVec2(p0.x + c + 0.5f, mid - hgt), ImVec2(p0.x + c + 0.5f, mid + hgt),
+                                 IM_COL32(90, 200, 255, 230));
+                }
+                if (g_audio.playing() && g_audio_call_id == g_selected_voice && n > 0) {
+                    const double t = g_audio.position_sec();
+                    const float x = p0.x + (float)std::min(1.0, t * 8000.0 / n) * ww;
+                    wdl->AddLine(ImVec2(x, p0.y), ImVec2(x, p1.y), IM_COL32(255, 120, 80, 255), 2.0f);
+                }
+                if (ImGui::IsItemHovered()) {
+                    const float fx = (ImGui::GetIO().MousePos.x - p0.x) / std::max(1.0f, ww);
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    ImGui::SetTooltip("%.1f s  (click to play from here)", std::clamp(fx, 0.0f, 1.0f) * n / 8000.0f);
+                }
+                if (wclick && n > 0) {
+                    // Jump within the loaded call, or start the selected one there.
+                    const float at = std::clamp((ImGui::GetIO().MousePos.x - p0.x) / std::max(1.0f, ww), 0.0f, 1.0f) * n / 8000.0f;
+                    if (g_audio_call_id != g_selected_voice || !g_audio.playing()) {
+                        if (g_audio_call_id != g_selected_voice) { g_audio.play(g_voice_cache, 8000); g_audio_call_id = g_selected_voice; }
                     }
-                    ImPlot::SetupAxes("s", "", 0, ImPlotAxisFlags_AutoFit);
-                    ImPlot::PlotLine("wave", xs.data(), ys.data(), (int)xs.size());
-                    ImPlot::EndPlot();
+                    g_audio.seek(at);
                 }
             } else {
-                ImGui::TextDisabled("(no audio captured for this call yet)");
+                ImGui::TextDisabled("Call #%d: no audio captured yet", g_selected_voice);
             }
+            const iridi::VoiceCall *selc = nullptr;
+            for (const auto &c : calls) if (c.id == g_selected_voice) selc = &c;
+            if (selc) draw_call_transcript(*selc);
         }
+
+        // Finished calls: sortable, and frozen while the pointer is over the
+        // list so rows don't move under the mouse.
+        static std::vector<iridi::VoiceCall> fin_shown;
+        static bool fin_hovered = false;
+        if (!fin_hovered) fin_shown = std::move(fin);
+        ImGui::TextDisabled("Finished (%zu shown)%s", fin_shown.size(),
+                            fin_hovered ? "   - list paused while the pointer is over it" : "");
+        const float fin_h = std::max(140.0f, ImGui::GetContentRegionAvail().y);
+        const ImVec2 fin_p0 = ImGui::GetCursorScreenPos();
+        const ImVec2 fin_p1(fin_p0.x + ImGui::GetContentRegionAvail().x, fin_p0.y + fin_h);
+        if (ImGui::BeginTable("calls", 12,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY |
+                ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate,
+                ImVec2(0, fin_h))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 52);
+            ImGui::TableSetupColumn("Started", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort |
+                                               ImGuiTableColumnFlags_PreferSortDescending, 70);
+            ImGui::TableSetupColumn("MHz", ImGuiTableColumnFlags_WidthFixed, 88);
+            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 46);
+            ImGui::TableSetupColumn("Dur s", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_PreferSortDescending, 56);
+            ImGui::TableSetupColumn("Speech", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_PreferSortDescending, 56);
+            ImGui::TableSetupColumn("Frames", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_PreferSortDescending, 56);
+            ImGui::TableSetupColumn("Err", ImGuiTableColumnFlags_WidthFixed, 50);
+            ImGui::TableSetupColumn("Miss", ImGuiTableColumnFlags_WidthFixed, 44);
+            ImGui::TableSetupColumn("HO", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_PreferSortDescending, 34);
+            ImGui::TableSetupColumn("Saved", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 44);
+            ImGui::TableSetupColumn("Transcript", ImGuiTableColumnFlags_NoSort);
+            ImGui::TableHeadersRow();
+            if (ImGuiTableSortSpecs *ss = ImGui::TableGetSortSpecs()) {
+                if (ss->SpecsCount > 0) {
+                    const ImGuiTableColumnSortSpecs spec = ss->Specs[0];
+                    auto key = [&](const iridi::VoiceCall &c) -> double {
+                        switch (spec.ColumnIndex) {
+                        case 0: return c.id;
+                        case 2: return c.channel_hz;
+                        case 3: return c.subtype.empty() ? 0 : (double)(unsigned char)c.subtype.back();
+                        case 4: return c.duration_s;
+                        case 5: return c.speech_s;
+                        case 6: return c.frames;
+                        case 7: return c.error_ratio;
+                        case 8: return c.missing;
+                        case 9: return c.handoffs;
+                        default: return (double)c.start_ns;
+                        }
+                    };
+                    const bool asc = spec.SortDirection == ImGuiSortDirection_Ascending;
+                    std::stable_sort(fin_shown.begin(), fin_shown.end(), [&](const auto &x, const auto &y) {
+                        const double kx = key(x), ky = key(y);
+                        if (kx != ky) return asc ? kx < ky : kx > ky;
+                        return x.start_ns > y.start_ns;
+                    });
+                } else {
+                    std::stable_sort(fin_shown.begin(), fin_shown.end(),
+                                     [](const auto &x, const auto &y) { return x.start_ns > y.start_ns; });
+                }
+            }
+            for (const auto &cv : fin_shown) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                char lbl[32]; snprintf(lbl, sizeof(lbl), "#%d", cv.id);
+                if (ImGui::Selectable(lbl, g_selected_voice == cv.id, ImGuiSelectableFlags_SpanAllColumns))
+                    select_row(cv.id);
+                if (!cv.wav_path.empty() && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", cv.wav_path.c_str());
+                char tb[16]; hhmmss(cv.start_ns, tb, sizeof(tb));
+                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(tb);
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%.4f", cv.channel_hz / 1e6);
+                ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(cv.subtype.c_str());
+                ImGui::TableSetColumnIndex(4); ImGui::Text("%.1f", cv.duration_s);
+                ImGui::TableSetColumnIndex(5);
+                if (cv.speech_s > 0) ImGui::Text("%.1f", cv.speech_s); else ImGui::TextDisabled("-");
+                ImGui::TableSetColumnIndex(6); ImGui::Text("%d", cv.frames);
+                ImGui::TableSetColumnIndex(7);
+                ImGui::TextColored(cv.error_ratio < 0.5f ? ImVec4(0.5f, 1, 0.5f, 1) : ImVec4(0.9f, 0.7f, 0.4f, 1),
+                                   "%.2f", cv.error_ratio);
+                ImGui::TableSetColumnIndex(8);
+                if (cv.missing > 0) ImGui::Text("%d", cv.missing); else ImGui::TextDisabled("-");
+                ImGui::TableSetColumnIndex(9);
+                if (cv.handoffs > 0) ImGui::Text("%d", cv.handoffs); else ImGui::TextDisabled("-");
+                ImGui::TableSetColumnIndex(10);
+                if (!cv.announcement.empty()) {
+                    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.95f, 1.0f), "ANN");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Network announcement: %s\n%s", cv.announcement.c_str(), cv.wav_path.c_str());
+                } else if (!cv.wav_path.empty()) ImGui::TextUnformatted("WAV");
+                else {
+                    ImGui::TextDisabled("-");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Not saved: under 1 s of speech (silence or the network's\n"
+                                          "once-a-second silence updates only).");
+                }
+                ImGui::TableSetColumnIndex(11);
+                switch (cv.tx_state) {
+                case 1:
+                    ImGui::TextDisabled(stt::Transcriber::instance().busy_id() == cv.id ? "transcribing..." : "queued");
+                    break;
+                case 2: {
+                    ImGui::TextDisabled("[%s]", cv.language.c_str());
+                    ImGui::SameLine(0, 4);
+                    ImGui::TextUnformatted(cv.transcript.c_str());
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::BeginTooltip();
+                        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 40.0f);
+                        ImGui::TextUnformatted(cv.transcript.c_str());
+                        if (!cv.transcript_en.empty()) {
+                            ImGui::Separator();
+                            ImGui::TextDisabled("English:");
+                            ImGui::TextUnformatted(cv.transcript_en.c_str());
+                        }
+                        ImGui::PopTextWrapPos();
+                        ImGui::EndTooltip();
+                    }
+                    break;
+                }
+                case 3: ImGui::TextDisabled("(no speech)"); break;
+                case 4: ImGui::TextDisabled("(failed)"); break;
+                default: break;
+                }
+            }
+            ImGui::EndTable();
+        }
+        // Pause the list while the pointer is over it and this window is the
+        // one under the mouse (not a popup or another window on top).
+        fin_hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+                      ImGui::IsMouseHoveringRect(fin_p0, fin_p1, false);
     }
     ImGui::End();
 }
@@ -2145,7 +3779,7 @@ void draw_sdr_source_controls() {
             // Re-open the device so the port is applied through the same
             // start-up path; live antenna updates are unstable on RSPdx/RSPduo.
             if (g_sdr.is_open()) {
-                add_log("Restarting SDRplay for antenna port: %s",
+                add_log("[RADIO] Restarting SDRplay for antenna port: %s",
                         selected->ports[g_sdr_antenna].c_str());
                 g_engine.stop();
                 g_sdr.close();
@@ -2188,7 +3822,7 @@ void draw_sdr_source_controls() {
     g_engine.stop();
     g_lookup.stop();
     g_sdr.close();
-            add_log("SDRplay stopped");
+            add_log("[RADIO] SDRplay stopped");
         }
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "streaming: %s", g_sdr.device_name().c_str());
@@ -2252,7 +3886,7 @@ void draw_hackrf_source_controls() {
         if (ImGui::Button("Stop HackRF")) {
             g_engine.stop();
             g_hackrf.close();
-            add_log("HackRF stopped");
+            add_log("[RADIO] HackRF stopped");
         }
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "streaming: %s",
@@ -2261,6 +3895,232 @@ void draw_hackrf_source_controls() {
 #ifndef HAS_HACKRF
     ImGui::EndDisabled();
 #endif
+}
+
+// ---- Airspy gain sweep ------------------------------------------------------
+// Steps through gain settings in shuffled order over several rounds and
+// measures good (error-free) frames per second at each, so satellite passes
+// coming and going average out instead of biasing the result.
+struct GainSweep {
+    bool running = false;
+    int mode = 0;                 // 0 = Sensitivity, 1 = Linearity
+    int lo = 4, hi = 19, step = 3;
+    int dwell_s = 10, rounds = 20;
+    int settle_s = 2;
+    std::vector<int> order;       // full schedule: gain values
+    size_t pos = 0;
+    bool settled = false;
+    std::chrono::steady_clock::time_point t0;
+    uint64_t parsed0 = 0, err0 = 0, ok0 = 0, fail0 = 0;
+    int restore_gain = 10;
+    struct Acc {
+        double secs = 0; uint64_t good = 0, parsed = 0, errs = 0, demod_ok = 0, demod_fail = 0;
+        std::vector<double> rates; // good frames/s of each individual test
+        // Standard error of the mean across tests: how much the average could
+        // move from traffic variation alone.
+        double sem() const {
+            if (rates.size() < 2) return 0.0;
+            double m = 0; for (double r : rates) m += r; m /= rates.size();
+            double v = 0; for (double r : rates) v += (r - m) * (r - m); v /= (rates.size() - 1);
+            return std::sqrt(v / rates.size());
+        }
+    };
+    std::map<int, Acc> acc;
+    int best = -1;
+};
+GainSweep g_sweep;
+
+static void sweep_apply_gain(int g) {
+    if (g_sweep.mode == 0) { g_ap_sense = g; g_airspy.set_sense_gain(g); }
+    else { g_ap_linear = g; g_airspy.set_linear_gain(g); }
+}
+
+static void sweep_compute_best() {
+    double best_rate = -1.0;
+    g_sweep.best = -1;
+    for (const auto &kv : g_sweep.acc) {
+        if (kv.second.secs <= 0) continue;
+        const double r = kv.second.good / kv.second.secs;
+        if (r > best_rate) { best_rate = r; g_sweep.best = kv.first; }
+    }
+}
+
+static void sweep_finish(bool completed) {
+    g_sweep.running = false;
+    sweep_compute_best();
+    sweep_apply_gain(g_sweep.restore_gain);
+    if (completed && g_sweep.best >= 0) {
+        add_log("[RADIO] Gain sweep done (%s mode). Results, good frames/s:",
+                g_sweep.mode == 0 ? "Sensitivity" : "Linearity");
+        for (const auto &kv : g_sweep.acc) {
+            const auto &a = kv.second;
+            if (a.secs <= 0) continue;
+            add_log("  gain %2d: %6.1f +/- %4.1f good frames/s   parse errors %4.1f%%   demod failed %4.1f%%   (%.0f s)",
+                    kv.first, a.good / a.secs, a.sem(), a.parsed ? 100.0 * a.errs / a.parsed : 0.0,
+                    (a.demod_ok + a.demod_fail) ? 100.0 * a.demod_fail / (a.demod_ok + a.demod_fail) : 0.0,
+                    a.secs);
+        }
+        add_log("[RADIO] Gain sweep best: %d (gain restored to %d until you apply it)", g_sweep.best, g_sweep.restore_gain);
+    } else {
+        add_log("[RADIO] Gain sweep stopped; gain restored to %d", g_sweep.restore_gain);
+    }
+}
+
+static void sweep_snapshot() {
+    const auto st = g_engine.stats();
+    g_sweep.parsed0 = g_engine.parsed_count();
+    g_sweep.err0 = g_engine.parse_error_count();
+    g_sweep.ok0 = st.frames_ok;
+    g_sweep.fail0 = st.frames_fail;
+}
+
+static void sweep_start() {
+    if (g_ap_gain_mode != 0 && g_ap_gain_mode != 1) { add_log("Gain sweep: switch Gain mode to Sensitivity or Linearity first"); return; }
+    if (!g_airspy.is_open() || !g_engine.running()) { add_log("Gain sweep: start the Airspy first"); return; }
+    g_sweep.mode = g_ap_gain_mode;
+    g_sweep.restore_gain = g_sweep.mode == 0 ? g_ap_sense : g_ap_linear;
+    g_sweep.acc.clear();
+    g_sweep.order.clear();
+    std::vector<int> gains;
+    for (int g = std::min(g_sweep.lo, g_sweep.hi); g <= std::max(g_sweep.lo, g_sweep.hi); g += std::max(1, g_sweep.step))
+        gains.push_back(g);
+    std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
+    for (int r = 0; r < std::max(1, g_sweep.rounds); r++) {
+        std::shuffle(gains.begin(), gains.end(), rng);
+        g_sweep.order.insert(g_sweep.order.end(), gains.begin(), gains.end());
+    }
+    g_sweep.pos = 0;
+    g_sweep.settled = false;
+    g_sweep.best = -1;
+    g_sweep.running = true;
+    sweep_apply_gain(g_sweep.order[0]);
+    g_sweep.t0 = std::chrono::steady_clock::now();
+    add_log("[RADIO] Gain sweep started: %zu settings x %d rounds, %d s each (~%.0f min)", gains.size(),
+            std::max(1, g_sweep.rounds), g_sweep.dwell_s, g_sweep.order.size() * g_sweep.dwell_s / 60.0);
+}
+
+// Called every frame.
+static void sweep_tick() {
+    if (!g_sweep.running) return;
+    if (!g_airspy.is_open() || !g_engine.running()) { sweep_finish(false); return; }
+    const auto now = std::chrono::steady_clock::now();
+    const double el = std::chrono::duration<double>(now - g_sweep.t0).count();
+    if (!g_sweep.settled) {
+        if (el >= g_sweep.settle_s) { sweep_snapshot(); g_sweep.settled = true; g_sweep.t0 = now; }
+        return;
+    }
+    if (el < g_sweep.dwell_s) return;
+    const auto st = g_engine.stats();
+    auto &a = g_sweep.acc[g_sweep.order[g_sweep.pos]];
+    const uint64_t parsed = g_engine.parsed_count() - g_sweep.parsed0;
+    const uint64_t errs = g_engine.parse_error_count() - g_sweep.err0;
+    a.secs += el;
+    a.parsed += parsed;
+    a.errs += errs;
+    a.good += parsed - std::min(parsed, errs);
+    a.rates.push_back(el > 0 ? (parsed - std::min(parsed, errs)) / el : 0.0);
+    a.demod_ok += st.frames_ok - g_sweep.ok0;
+    a.demod_fail += st.frames_fail - g_sweep.fail0;
+    sweep_compute_best();
+    if (++g_sweep.pos >= g_sweep.order.size()) { sweep_finish(true); return; }
+    sweep_apply_gain(g_sweep.order[g_sweep.pos]);
+    g_sweep.settled = false;
+    g_sweep.t0 = now;
+}
+
+static void draw_gain_sweep() {
+    if (!ImGui::CollapsingHeader("Gain sweep (find best gain)")) return;
+    ImGui::TextWrapped("Tests each gain many times in shuffled order and measures good "
+                       "(error-free) frames per second. Short tests with many rounds spread "
+                       "changing satellite traffic evenly across all settings. Uses the current "
+                       "Gain mode (Sensitivity or Linearity). Keep the antenna still while it runs.");
+    ImGui::BeginDisabled(g_sweep.running);
+    ImGui::SetNextItemWidth(160); ImGui::DragIntRange2("Gain range", &g_sweep.lo, &g_sweep.hi, 0.2f, 0, 21);
+    ImGui::SetNextItemWidth(160); ImGui::SliderInt("Step", &g_sweep.step, 1, 5);
+    ImGui::SetNextItemWidth(160); ImGui::SliderInt("Seconds per test", &g_sweep.dwell_s, 5, 120);
+    ImGui::SetNextItemWidth(160); ImGui::SliderInt("Rounds", &g_sweep.rounds, 1, 40);
+    ImGui::EndDisabled();
+    {
+        int n = 0;
+        for (int g = std::min(g_sweep.lo, g_sweep.hi); g <= std::max(g_sweep.lo, g_sweep.hi); g += std::max(1, g_sweep.step)) n++;
+        ImGui::TextDisabled("%d settings x %d rounds x %d s = about %.0f min", n, g_sweep.rounds, g_sweep.dwell_s + g_sweep.settle_s,
+                            n * g_sweep.rounds * (g_sweep.dwell_s + g_sweep.settle_s) / 60.0);
+    }
+    if (!g_sweep.running) {
+        ImGui::BeginDisabled(!g_airspy.is_open() || !g_engine.running());
+        if (ImGui::Button("Start sweep")) sweep_start();
+        ImGui::EndDisabled();
+    } else {
+        if (ImGui::Button("Stop sweep")) sweep_finish(false);
+        ImGui::SameLine();
+        ImGui::Text("Test %zu / %zu: gain %d", g_sweep.pos + 1, g_sweep.order.size(), g_sweep.order[g_sweep.pos]);
+        ImGui::ProgressBar((float)g_sweep.pos / (float)std::max<size_t>(1, g_sweep.order.size()), ImVec2(-1, 0));
+    }
+    if (g_sweep.acc.empty()) return;
+
+    // Results
+    std::vector<double> xs, ys, es;
+    for (const auto &kv : g_sweep.acc)
+        if (kv.second.secs > 0) {
+            xs.push_back(kv.first); ys.push_back(kv.second.good / kv.second.secs); es.push_back(kv.second.sem());
+        }
+    if (!xs.empty() && ImPlot::BeginPlot("##sweep", ImVec2(-1, 160), ImPlotFlags_NoLegend | ImPlotFlags_NoMouseText)) {
+        ImPlot::SetupAxes(g_sweep.mode == 0 ? "Sensitivity gain" : "Linearity gain", "good frames/s",
+                          ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+        ImPlot::PlotBars("good", xs.data(), ys.data(), (int)xs.size(), 0.7);
+        {
+            ImPlotSpec es_spec;
+            es_spec.LineColor = ImVec4(1.0f, 1.0f, 1.0f, 0.85f);
+            es_spec.LineWeight = 1.5f;
+            ImPlot::PlotErrorBars("spread", xs.data(), ys.data(), es.data(), (int)xs.size(), es_spec);
+        }
+        if (g_sweep.best >= 0) {
+            double bx = g_sweep.best, by = 0;
+            for (size_t i = 0; i < xs.size(); i++) if (xs[i] == bx) by = ys[i];
+            ImPlotSpec spec;
+            spec.FillColor = ImVec4(0.3f, 1.0f, 0.4f, 1.0f);
+            spec.LineColor = ImVec4(0.3f, 1.0f, 0.4f, 1.0f);
+            ImPlot::PlotBars("best", &bx, &by, 1, 0.7, spec);
+        }
+        ImPlot::EndPlot();
+    }
+    if (ImGui::BeginTable("sweepres", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
+                          ImVec2(0, 150))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Gain");
+        ImGui::TableSetupColumn("Good/s");
+        ImGui::TableSetupColumn("+/-");
+        ImGui::TableSetupColumn("Parse err %");
+        ImGui::TableSetupColumn("Demod fail %");
+        ImGui::TableSetupColumn("Tested s");
+        ImGui::TableHeadersRow();
+        for (const auto &kv : g_sweep.acc) {
+            const auto &a = kv.second;
+            if (a.secs <= 0) continue;
+            ImGui::TableNextRow();
+            const bool isBest = kv.first == g_sweep.best;
+            const ImVec4 c = isBest ? ImVec4(0.4f, 1.0f, 0.5f, 1.0f) : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+            ImGui::TableSetColumnIndex(0); ImGui::TextColored(c, "%d%s", kv.first, isBest ? "  best" : "");
+            ImGui::TableSetColumnIndex(1); ImGui::TextColored(c, "%.1f", a.good / a.secs);
+            ImGui::TableSetColumnIndex(2);
+            if (a.rates.size() >= 2) ImGui::Text("%.1f", a.sem()); else ImGui::TextDisabled("-");
+            ImGui::TableSetColumnIndex(3); ImGui::Text("%.1f", a.parsed ? 100.0 * a.errs / a.parsed : 0.0);
+            ImGui::TableSetColumnIndex(4);
+            ImGui::Text("%.1f", (a.demod_ok + a.demod_fail) ? 100.0 * a.demod_fail / (a.demod_ok + a.demod_fail) : 0.0);
+            ImGui::TableSetColumnIndex(5); ImGui::Text("%.0f", a.secs);
+        }
+        ImGui::EndTable();
+    }
+    if (!g_sweep.running && g_sweep.best >= 0) {
+        char lbl[48];
+        snprintf(lbl, sizeof(lbl), "Apply best (%d)", g_sweep.best);
+        if (ImGui::Button(lbl)) {
+            sweep_apply_gain(g_sweep.best);
+            add_log("[RADIO] Applied gain %d from sweep", g_sweep.best);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("Overlapping error bars = no real difference; prefer the lower gain.");
+    }
 }
 
 void draw_airspy_source_controls() {
@@ -2290,9 +4150,78 @@ void draw_airspy_source_controls() {
     if (ImGui::Button("Refresh")) request_ap_device_scan();
     ImGui::EndDisabled();
 
-    ImGui::SetNextItemWidth(200);
-    if (ImGui::Combo("Sample rate (Msps)", &g_ap_rate_idx, kAirspyRateLabels, kNumAirspyRates)) {
-        if (g_airspy.is_open()) apply_sample_rate(3, kAirspyRates[g_ap_rate_idx]);
+    {
+        // Rates offered: what the selected device reports, else the generic list.
+        std::vector<double> rates;
+        bool isMini = false;
+        if (!devs.empty()) {
+            const int idx = (g_ap_device_idx >= 0 && g_ap_device_idx < (int)devs.size()) ? g_ap_device_idx : 0;
+            rates = devs[idx].rates;
+            isMini = devs[idx].name.find("Mini") != std::string::npos;
+        }
+        if (rates.empty()) rates.assign(kAirspyRates, kAirspyRates + kNumAirspyRates);
+        if (isMini) {
+            // Airspy lists 10 Msps for the Mini, but its firmware only
+            // advertises 6 / 3, so offer it as an explicit opt-in.
+            ImGui::BeginDisabled(g_airspy.is_open());
+            ImGui::Checkbox("Unofficial 10 Msps mode", &g_ap_unofficial10);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Runs the Mini's ADC at 20 MHz for 10 Msps IQ (covers the whole\n"
+                                  "Iridium band). Not officially supported: expect a few fixed\n"
+                                  "spurs, more heat, and possibly dropped samples.\n"
+                                  "Change while the Airspy is stopped.");
+            if (g_ap_unofficial10 && std::find(rates.begin(), rates.end(), 10.0e6) == rates.end())
+                rates.push_back(10.0e6);
+            if (!g_ap_unofficial10 && g_ap_rate_hz == 10.0e6) g_ap_rate_hz = 0.0;
+        }
+        std::sort(rates.rbegin(), rates.rend());
+        if (std::find(rates.begin(), rates.end(), g_ap_rate_hz) == rates.end())
+            g_ap_rate_hz = rates.front(); // e.g. 10 Msps chosen, Mini plugged in -> 6
+        char cur[32];
+        std::snprintf(cur, sizeof(cur), "%.1f", g_ap_rate_hz / 1e6);
+        ImGui::SetNextItemWidth(200);
+        if (ImGui::BeginCombo("Sample rate (Msps)", cur)) {
+            for (double r : rates) {
+                char lbl[32];
+                std::snprintf(lbl, sizeof(lbl), "%.1f", r / 1e6);
+                if (ImGui::Selectable(lbl, r == g_ap_rate_hz) && r != g_ap_rate_hz) {
+                    g_ap_rate_hz = r;
+                    if (g_airspy.is_open()) {
+                        apply_sample_rate(3, r);
+                        g_ap_rate_hz = (double)g_airspy.sample_rate();
+                    }
+                }
+            }
+            ImGui::EndCombo();
+        }
+        {
+            ImGui::TextDisabled("%.1f Msps covers %.2f-%.2f MHz around the VFO.", g_ap_rate_hz / 1e6,
+                                g_vfo_hz / 1e6 - g_ap_rate_hz / 2e6, g_vfo_hz / 1e6 + g_ap_rate_hz / 2e6);
+            // Ring alert, paging and messaging channels sit at 1626.0-1626.5 MHz.
+            // Keep them ~0.6 MHz inside the band edge, where the filter is flat.
+            const double upper = (1626.5e6 + 0.6e6) - g_ap_rate_hz / 2.0;
+            if (std::fabs(g_vfo_hz - upper) > 1000.0) {
+                char btn[64];
+                std::snprintf(btn, sizeof(btn), "Centre on upper band (%.3f MHz)", upper / 1e6);
+                if (ImGui::SmallButton(btn)) {
+                    // Move the spectrum view with the VFO; otherwise sync_view()
+                    // sees the old view outside the new passband and retunes back.
+                    const double shift = (upper - g_vfo_hz) / 1e6;
+                    retune_vfo(upper);
+                    if (g_view_hi_mhz > g_view_lo_mhz) {
+                        g_view_lo_mhz += shift;
+                        g_view_hi_mhz += shift;
+                        g_view_dirty = true;
+                    } else {
+                        g_view_reset = true;
+                    }
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Covers the ring alert / paging / messaging channels\n"
+                                      "(1626.0-1626.5 MHz) plus the duplex channels below them.");
+            }
+        }
     }
 
     const char *modes[] = {"Sensitivity", "Linear", "Free"};
@@ -2324,6 +4253,7 @@ void draw_airspy_source_controls() {
         if (ImGui::SliderInt("VGA gain", &g_ap_vga, 0, 15, "%d")) g_airspy.set_vga_gain(g_ap_vga);
     }
     if (ImGui::Checkbox("Bias tee", &g_ap_bias)) g_airspy.set_bias_tee(g_ap_bias);
+    draw_gain_sweep();
 
 #ifndef HAS_AIRSPY
     ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f),
@@ -2338,7 +4268,7 @@ void draw_airspy_source_controls() {
         if (ImGui::Button("Stop Airspy")) {
             g_engine.stop();
             g_airspy.close();
-            add_log("Airspy stopped");
+            add_log("[RADIO] Airspy stopped");
         }
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "streaming: %s",
@@ -2414,7 +4344,7 @@ void draw_rtlsdr_source_controls() {
         if (ImGui::Button("Stop RTL-SDR")) {
             g_engine.stop();
             g_rtlsdr.close();
-            add_log("RTL-SDR stopped");
+            add_log("[RADIO] RTL-SDR stopped");
         }
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "streaming: %s",
@@ -2486,6 +4416,43 @@ void draw_source_window() {
         if (g_source_kind != 0) {
             ImGui::Separator();
             ImGui::Text("VFO: %.4f MHz", active_source()->center_frequency() / 1e6);
+            // Raw IQ recording of the live radio.
+            const auto &rec = g_engine.iq_recorder();
+            if (!rec.active()) {
+                ImGui::BeginDisabled(!g_engine.running());
+                if (ImGui::Button("Record IQ")) {
+                    std::string err;
+                    if (g_engine.start_iq_recording("recordings/iq", err))
+                        add_log("[RADIO] IQ recording started: %s", rec.current_file().c_str());
+                    else add_log("[RADIO] IQ recording failed: %s", err.c_str());
+                }
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    const double rate = active_source()->sample_rate();
+                    ImGui::SetTooltip("Record the radio's raw IQ to recordings/iq as 16-bit WAV\n"
+                                      "(plays back in IridiScope with its real time and frequency).\n"
+                                      "Uses %.0f MB per second at the current rate; a new file\n"
+                                      "starts every ~2 GB.", rate * 4 / 1e6);
+                }
+            } else {
+                if (ImGui::Button("Stop IQ recording")) {
+                    g_engine.stop_iq_recording();
+                    add_log("[RADIO] IQ recording stopped: %.1f s, %.2f GB in %d file(s)%s", rec.seconds_recorded(),
+                            rec.bytes_written() / 1e9, rec.files_written(),
+                            rec.dropped_blocks() ? " (some blocks dropped: disk too slow)" : "");
+                }
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "REC %.0f s  %.2f GB", rec.seconds_recorded(),
+                                   rec.bytes_written() / 1e9);
+                if (rec.dropped_blocks()) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "(%llu blocks dropped: disk behind)",
+                                       (unsigned long long)rec.dropped_blocks());
+                }
+                std::string f = rec.current_file();
+                const size_t sl = f.find_last_of("/\\");
+                ImGui::TextDisabled("%s", sl == std::string::npos ? f.c_str() : f.c_str() + sl + 1);
+            }
         }
         }
         ImGui::Separator();
@@ -2496,7 +4463,7 @@ void draw_source_window() {
             draw_stats_contents();
 
         ImGui::Separator();
-        if (ImGui::CollapsingHeader("Wireshark output", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::CollapsingHeader("Wireshark output")) {
             if (ImGui::Checkbox("Enable GSMTAP", &g_gsmtap_on)) {
                 if (g_gsmtap_on) {
                     std::string err;
@@ -2538,7 +4505,7 @@ void draw_source_window() {
         }
 
         ImGui::Separator();
-        if (ImGui::CollapsingHeader("Data", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::CollapsingHeader("Data")) {
             if (ImGui::Button("Save decoded data...")) {
                 std::string path = save_file_dialog();
                 if (!path.empty()) save_decoded_csv(path);
@@ -2618,28 +4585,23 @@ void build_default_dock_layout(ImGuiID dockspace_id) {
     ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
     ImGui::DockBuilderSetNodeSize(dockspace_id, ImGui::GetMainViewport()->Size);
 
-    ImGuiID center = dockspace_id;
-    ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.34f, nullptr, &center);
-    ImGuiID right  = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.34f, nullptr, &center);
-    ImGuiID left   = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.22f, nullptr, &center);
+    // Layout: Control on the left, Map in the centre, Messages/Log/Satellites/
+    // Paging/Spectrum on the right, and the decoders (Waterfall, Voice, ACARS,
+    // ...) across the full width at the bottom.
+    ImGuiID top = dockspace_id;
+    ImGuiID bottom = ImGui::DockBuilderSplitNode(top, ImGuiDir_Down, 0.36f, nullptr, &top);
+    ImGuiID center = top;
+    ImGuiID left   = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.19f, nullptr, &center);
+    ImGuiID right  = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.225f, nullptr, &center);
 
+    ImGui::DockBuilderDockWindow("Control###Source", left);
     ImGui::DockBuilderDockWindow("Map", center);
-    ImGui::DockBuilderDockWindow("Spectrum", right);
-    ImGui::DockBuilderDockWindow("Bursts", right);
-    ImGui::DockBuilderDockWindow("Waterfall", bottom);
-    ImGui::DockBuilderDockWindow("Messages", bottom);
-    ImGui::DockBuilderDockWindow("Bursts", bottom);
-    ImGui::DockBuilderDockWindow("Voice", bottom);
-    ImGui::DockBuilderDockWindow("ACARS", bottom);
-    ImGui::DockBuilderDockWindow("Pager", bottom);
-    ImGui::DockBuilderDockWindow("SMS", bottom);
-    ImGui::DockBuilderDockWindow("SBD", bottom);
-    ImGui::DockBuilderDockWindow("Signaling", bottom);
-    ImGui::DockBuilderDockWindow("Broadcast", bottom);
-    ImGui::DockBuilderDockWindow("ITL", bottom);
-    ImGui::DockBuilderDockWindow("Satellites", left);
-    ImGui::DockBuilderDockWindow("Paging", left);
-    ImGui::DockBuilderDockWindow("Source", left);
+    for (const char *w : {"Messages", "Log", "Satellites", "Paging", "Spectrum"})
+        ImGui::DockBuilderDockWindow(w, right);
+    for (const char *w : {"Waterfall", "Bursts", "Voice", "ACARS", "Pager", "SMS", "SBD",
+                          "Signaling", "Broadcast", "ITL"})
+        ImGui::DockBuilderDockWindow(w, bottom);
+    g_layout_focus_frames = 2;
     ImGui::DockBuilderFinish(dockspace_id);
 }
 
@@ -3069,6 +5031,343 @@ static void attach_console() {
 #endif
 }
 
+// ---- Saved settings ---------------------------------------------------------
+// Input, radio, decoding, voice and display settings are stored in
+// iridiscope.ini (section [IridiScope][Settings]) next to the window layout,
+// so IridiScope starts the way it was left.
+namespace {
+constexpr int kLayoutVersion = 3;   // bump to apply a new default layout once
+int g_saved_layout_version = 0;      // from the ini (0 = none saved)
+bool g_settings_loaded = false;
+
+struct SettingRef {
+    const char *key;
+    enum Kind { I, F, D, B, S } kind;
+    void *ptr;
+    size_t cap; // for strings (char arrays)
+};
+
+std::vector<SettingRef> settings_table() {
+    using K = SettingRef::Kind;
+    return {
+        {"source_kind", K::I, &g_source_kind, 0},
+        {"vfo_hz", K::D, &g_vfo_hz, 0},
+        {"sdr_rate_idx", K::I, &g_sdr_rate_idx, 0}, {"sdr_device_idx", K::I, &g_sdr_device_idx, 0},
+        {"sdr_antenna", K::I, &g_sdr_antenna, 0}, {"sdr_agc", K::B, &g_sdr_agc, 0},
+        {"sdr_gr", K::F, &g_sdr_gr, 0}, {"sdr_bias", K::B, &g_sdr_bias, 0},
+        {"hrf_rate_idx", K::I, &g_hrf_rate_idx, 0}, {"hrf_device_idx", K::I, &g_hrf_device_idx, 0},
+        {"hrf_lna", K::I, &g_hrf_lna, 0}, {"hrf_vga", K::I, &g_hrf_vga, 0},
+        {"hrf_amp", K::B, &g_hrf_amp, 0}, {"hrf_bias", K::B, &g_hrf_bias, 0},
+        {"ap_rate_hz", K::D, &g_ap_rate_hz, 0}, {"ap_rate_idx", K::I, &g_ap_rate_idx, 0},
+        {"ap_unofficial10", K::B, &g_ap_unofficial10, 0}, {"ap_device_idx", K::I, &g_ap_device_idx, 0},
+        {"ap_gain_mode", K::I, &g_ap_gain_mode, 0}, {"ap_sense", K::I, &g_ap_sense, 0},
+        {"ap_linear", K::I, &g_ap_linear, 0}, {"ap_lna", K::I, &g_ap_lna, 0},
+        {"ap_mixer", K::I, &g_ap_mixer, 0}, {"ap_vga", K::I, &g_ap_vga, 0},
+        {"ap_lna_agc", K::B, &g_ap_lna_agc, 0}, {"ap_mixer_agc", K::B, &g_ap_mixer_agc, 0},
+        {"ap_bias", K::B, &g_ap_bias, 0},
+        {"rtl_rate_idx", K::I, &g_rtl_rate_idx, 0}, {"rtl_device_idx", K::I, &g_rtl_device_idx, 0},
+        {"rtl_agc", K::B, &g_rtl_agc, 0}, {"rtl_gain", K::F, &g_rtl_gain, 0},
+        {"rtl_ppm", K::I, &g_rtl_ppm, 0}, {"rtl_bias", K::B, &g_rtl_bias, 0},
+        {"queue_budget_idx", K::I, &g_queue_budget_idx, 0},
+        {"backlog_idx", K::I, &g_backlog_idx, 0}, {"reject_wide", K::B, &g_reject_wide, 0}, {"protect_radio", K::B, &g_protect_radio, 0},
+        {"voice_hide_failed", K::B, &g_voice_hide_failed, 0}, {"voice_max_err", K::F, &g_voice_max_err, 0},
+        {"voice_hide_short", K::B, &g_voice_hide_short, 0}, {"voice_min_s", K::F, &g_voice_min_s, 0}, {"voice_autoplay", K::B, &g_autoplay, 0},
+        {"log_status", K::B, &g_log_cat[0], 0}, {"log_alerts", K::B, &g_log_cat[1], 0}, {"log_radio", K::B, &g_log_cat[2], 0},
+        {"log_voice", K::B, &g_log_cat[3], 0}, {"log_handoffs", K::B, &g_log_cat[4], 0}, {"log_other", K::B, &g_log_cat[5], 0},
+        {"log_status_interval", K::I, &g_status_interval_idx, 0},
+        {"stt_on", K::B, &g_stt_on, 0}, {"stt_translate", K::B, &g_stt_translate, 0}, {"stt_large_all", K::B, &g_stt_large_all, 0},
+        {"stt_vocab", K::S, g_stt_vocab, sizeof(g_stt_vocab)},
+        {"fft_idx", K::I, &g_fft_idx, 0}, {"avg_alpha", K::F, &g_avg_alpha, 0},
+        {"autoscale", K::B, &g_autoscale, 0}, {"db_min", K::F, &g_db_min, 0}, {"db_max", K::F, &g_db_max, 0},
+        {"dc_block", K::B, &g_dc_block, 0},
+        {"gsmtap_host", K::S, g_gsmtap_host, sizeof(g_gsmtap_host)}, {"gsmtap_port", K::I, &g_gsmtap_port, 0},
+        {"lookup_enabled", K::B, &g_lookup_enabled, 0},
+        {"sweep_lo", K::I, &g_sweep.lo, 0}, {"sweep_hi", K::I, &g_sweep.hi, 0},
+        {"sweep_step", K::I, &g_sweep.step, 0}, {"sweep_dwell_s", K::I, &g_sweep.dwell_s, 0},
+        {"sweep_rounds", K::I, &g_sweep.rounds, 0},
+        {"show_map", K::B, &g_show_map, 0}, {"show_source", K::B, &g_show_source, 0},
+        {"show_spectrum", K::B, &g_show_spectrum, 0}, {"show_waterfall", K::B, &g_show_waterfall, 0},
+        {"show_bursts", K::B, &g_show_bursts, 0}, {"show_messages", K::B, &g_show_messages, 0},
+        {"show_log", K::B, &g_show_log, 0}, {"show_sats", K::B, &g_show_sats, 0},
+        {"show_voice", K::B, &g_show_voice, 0}, {"show_acars", K::B, &g_show_acars, 0},
+        {"show_pager", K::B, &g_show_pager, 0}, {"show_sms", K::B, &g_show_sms, 0},
+        {"show_sbd", K::B, &g_show_sbd, 0}, {"show_signaling", K::B, &g_show_signaling, 0},
+        {"show_broadcast", K::B, &g_show_broadcast, 0}, {"show_itl", K::B, &g_show_itl, 0},
+        {"show_paging", K::B, &g_show_paging, 0},
+        {"map_online", K::B, &g_map_online, 0},
+        {"map_night", K::B, &g_map_night, 0},
+        {"msgdb_on", K::B, &g_msgdb_on, 0},
+        {"voice_hide_ann", K::B, &g_voice_hide_ann, 0}, {"voice_sort_ann", K::B, &g_voice_sort_ann, 0},
+        {"sat_hide_after_s", K::F, &g_sat_hide_after_s, 0}, {"sat_show_stale", K::B, &g_sat_show_stale, 0},
+    };
+}
+
+// Settings held outside plain globals.
+bool g_set_sync_tol = true, g_set_follow = true, g_set_realtime = false;
+
+void *settings_read_open(ImGuiContext *, ImGuiSettingsHandler *, const char *name) {
+    return std::strcmp(name, "Settings") == 0 ? (void *)1 : nullptr;
+}
+
+void settings_read_line(ImGuiContext *, ImGuiSettingsHandler *, void *, const char *line) {
+    const char *eq = std::strchr(line, '=');
+    if (!eq) return;
+    const std::string key(line, eq - line);
+    const char *v = eq + 1;
+    g_settings_loaded = true;
+    if (key == "layout_version") { g_saved_layout_version = std::atoi(v); return; }
+    if (key == "sync_tolerance") { g_set_sync_tol = std::atoi(v) != 0; return; }
+    if (key == "follow_handoffs") { g_set_follow = std::atoi(v) != 0; return; }
+    if (key == "realtime") { g_set_realtime = std::atoi(v) != 0; return; }
+    for (const auto &r : settings_table()) {
+        if (key != r.key) continue;
+        switch (r.kind) {
+        case SettingRef::I: *(int *)r.ptr = std::atoi(v); break;
+        case SettingRef::F: *(float *)r.ptr = (float)std::atof(v); break;
+        case SettingRef::D: *(double *)r.ptr = std::atof(v); break;
+        case SettingRef::B: *(bool *)r.ptr = std::atoi(v) != 0; break;
+        case SettingRef::S: std::snprintf((char *)r.ptr, r.cap, "%s", v); break;
+        }
+        return;
+    }
+}
+
+void settings_apply_all(ImGuiContext *, ImGuiSettingsHandler *) {
+    // Keep loaded values in their valid ranges.
+    g_source_kind = std::clamp(g_source_kind, 0, 4);
+    g_sdr_rate_idx = std::clamp(g_sdr_rate_idx, 0, kNumSdrplayRates - 1);
+    g_hrf_rate_idx = std::clamp(g_hrf_rate_idx, 0, kNumHackrfRates - 1);
+    g_ap_rate_idx = std::clamp(g_ap_rate_idx, 0, kNumAirspyRates - 1);
+    g_rtl_rate_idx = std::clamp(g_rtl_rate_idx, 0, kNumRtlRates - 1);
+    g_ap_gain_mode = std::clamp(g_ap_gain_mode, 0, 2);
+    g_ap_sense = std::clamp(g_ap_sense, 0, 21);
+    g_ap_linear = std::clamp(g_ap_linear, 0, 21);
+    g_queue_budget_idx = std::clamp(g_queue_budget_idx, 0, 3);
+    g_backlog_idx = std::clamp(g_backlog_idx, 0, 3);
+    ir_set_reject_wide(g_reject_wide);
+    stt::Transcriber::instance().set_enabled(g_stt_on);
+    stt::Transcriber::instance().set_translate(g_stt_translate);
+    stt::Transcriber::instance().set_large_for_all(g_stt_large_all);
+    stt::Transcriber::instance().set_vocabulary(g_stt_vocab);
+    iridi_set_boost(g_protect_radio);
+    iridi_apply_thread_priority(IRIDI_PRIO_NORMAL);
+    g_voice_min_s = std::clamp(g_voice_min_s, 0.0f, 120.0f);
+    g_fft_idx = std::clamp(g_fft_idx, 0, kNumFftSizes - 1);
+    if (!(g_vfo_hz > 1e6)) g_vfo_hz = kDefaultVfoHz;
+    irid::irid_uw_ec.store(g_set_sync_tol);
+    g_engine.voices().set_follow_handoffs(g_set_follow);
+    g_engine.set_realtime(g_set_realtime);
+    g_lookup.set_enabled(g_lookup_enabled);
+}
+
+void settings_write_all(ImGuiContext *, ImGuiSettingsHandler *handler, ImGuiTextBuffer *buf) {
+    buf->appendf("[%s][Settings]\n", handler->TypeName);
+    buf->appendf("layout_version=%d\n", kLayoutVersion);
+    buf->appendf("sync_tolerance=%d\n", irid::irid_uw_ec.load() ? 1 : 0);
+    buf->appendf("follow_handoffs=%d\n", g_engine.voices().follow_handoffs() ? 1 : 0);
+    buf->appendf("realtime=%d\n", g_engine.realtime() ? 1 : 0);
+    for (const auto &r : settings_table()) {
+        switch (r.kind) {
+        case SettingRef::I: buf->appendf("%s=%d\n", r.key, *(int *)r.ptr); break;
+        case SettingRef::F: buf->appendf("%s=%.6g\n", r.key, *(float *)r.ptr); break;
+        case SettingRef::D: buf->appendf("%s=%.3f\n", r.key, *(double *)r.ptr); break;
+        case SettingRef::B: buf->appendf("%s=%d\n", r.key, *(bool *)r.ptr ? 1 : 0); break;
+        case SettingRef::S: buf->appendf("%s=%s\n", r.key, (const char *)r.ptr); break;
+        }
+    }
+    buf->append("\n");
+}
+
+void register_settings_handler() {
+    ImGuiSettingsHandler h;
+    h.TypeName = "IridiScope";
+    h.TypeHash = ImHashStr("IridiScope");
+    h.ReadOpenFn = settings_read_open;
+    h.ReadLineFn = settings_read_line;
+    h.ApplyAllFn = settings_apply_all;
+    h.WriteAllFn = settings_write_all;
+    ImGui::AddSettingsHandler(&h);
+}
+
+// Settings changes don't move windows, so tell ImGui to save when they change.
+void mark_settings_dirty_if_changed() {
+    static std::string last;
+    ImGuiTextBuffer b;
+    ImGuiSettingsHandler h; h.TypeName = "IridiScope";
+    settings_write_all(nullptr, &h, &b);
+    if (last != b.c_str()) {
+        if (!last.empty()) ImGui::MarkIniSettingsDirty();
+        last = b.c_str();
+    }
+}
+} // namespace
+
+// ---- Log: periodic status summary and automatic alerts --------------------
+
+// Whole-machine CPU busy % and IridiScope's share of the machine since the
+// previous call (Windows; false elsewhere or on the first call).
+struct CpuSampler {
+    uint64_t sys_busy = 0, sys_total = 0, proc = 0;
+    bool primed = false;
+    bool sample(double &sys_pct, double &proc_pct) {
+#ifdef _WIN32
+        FILETIME idle, kern, user, c, e, pk, pu;
+        if (!GetSystemTimes(&idle, &kern, &user) || !GetProcessTimes(GetCurrentProcess(), &c, &e, &pk, &pu)) return false;
+        auto u64 = [](const FILETIME &f) { return ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime; };
+        const uint64_t total = u64(kern) + u64(user);          // kernel time includes idle
+        const uint64_t busy = total - u64(idle), pr = u64(pk) + u64(pu);
+        const bool ok = primed && total > sys_total;
+        if (ok) {
+            sys_pct = 100.0 * (double)(busy - sys_busy) / (double)(total - sys_total);
+            proc_pct = 100.0 * (double)(pr - proc) / (double)(total - sys_total);
+        }
+        sys_busy = busy; sys_total = total; proc = pr; primed = true;
+        return ok;
+#else
+        (void)sys_pct; (void)proc_pct;
+        return false;
+#endif
+    }
+};
+
+static double process_ram_mb() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return pmc.WorkingSetSize / 1048576.0;
+#endif
+    return -1.0;
+}
+
+void log_status_tick() {
+    using clk = std::chrono::steady_clock;
+    const auto now = clk::now();
+    // Snapshot of the counters at the last summary.
+    struct Snap {
+        clk::time_point t; uint64_t parsed = 0, errs = 0, bursts = 0, wide = 0, skipped = 0, app = 0, drv = 0;
+        uint64_t msgs[7] = {}; uint64_t ann = 0, ho_seen = 0, ho_fol = 0, vrec = 0; double speech = 0;
+    };
+    static Snap last;
+    static bool have_last = false, was_running = false;
+    static std::deque<double> good_hist, burst_hist;   // rates of recent summaries
+    static float last_floor = 0.0f;
+    static bool have_floor = false;
+    static CpuSampler cpu_status, cpu_alert;
+    static clk::time_point next_sec = now;
+    static int sys_hot_s = 0, det_hot_s = 0, silent_s = 0;
+    static clk::time_point cool_cpu{}, cool_det{}, cool_silent{}, cool_drop{}, cool_floor{};
+    static uint64_t silent_ref_good = 0;
+    const auto cooled = [&](clk::time_point &t) {
+        if (t != clk::time_point{} && now - t < std::chrono::minutes(5)) return false;
+        t = now; return true;
+    };
+
+    const bool running = g_engine.running() && !g_engine.paused();
+    const auto *live = active_live_source();
+    auto take = [&]() {
+        Snap n; n.t = now;
+        n.parsed = g_engine.parsed_count(); n.errs = g_engine.parse_error_count();
+        n.bursts = g_engine.stats().bursts; n.wide = ir_wide_dropped(); n.skipped = g_engine.skipped_bursts();
+        n.app = live ? live->dropped_samples() : 0; n.drv = live ? live->driver_dropped_samples() : 0;
+        for (int i = 1; i <= 6; i++) n.msgs[i] = iridi::MsgDb::instance().count(i);
+        n.ann = g_engine.voices().announcements();
+        n.ho_seen = g_engine.voices().handoffs_seen(); n.ho_fol = g_engine.voices().handoffs_followed();
+        n.vrec = g_engine.voice_recovered(); n.speech = g_engine.voices().speech_total_s();
+        return n;
+    };
+    if (!running) { was_running = false; have_last = false; good_hist.clear(); burst_hist.clear(); have_floor = false; return; }
+    if (!was_running) {
+        was_running = true; last = take(); have_last = true;
+        { double a, b; cpu_status.sample(a, b); }   // prime
+        sys_hot_s = det_hot_s = silent_s = 0; silent_ref_good = last.parsed - last.errs;
+        return;
+    }
+
+    // ---- once a second: alerts ----
+    if (now >= next_sec) {
+        next_sec = now + std::chrono::seconds(1);
+        double sys = 0, proc = 0;
+        if (cpu_alert.sample(sys, proc)) {
+            sys_hot_s = sys >= 90.0 ? sys_hot_s + 1 : 0;
+            if (sys_hot_s == 10 && cooled(cool_cpu))
+                add_log("[ALERT] Computer CPU at %.0f%% for 10 s (IridiScope %.0f%% of it): another program is "
+                        "using the CPU; decoding may fall behind", sys, proc);
+        }
+        det_hot_s = g_det_load > 90.0 ? det_hot_s + 1 : 0;
+        if (det_hot_s == 10 && cooled(cool_det))
+            add_log("[ALERT] Detector load %.0f%% for 10 s (CPU %.0f%%, bursts/s %.0f): the radio thread is close "
+                    "to falling behind", g_det_load, std::max(0.0, g_det_cpu), g_bursts_ps);
+        const uint64_t good = g_engine.parsed_count() - std::min(g_engine.parsed_count(), g_engine.parse_error_count());
+        if (good != silent_ref_good) { silent_ref_good = good; silent_s = 0; }
+        else if (++silent_s == 30 && cooled(cool_silent))
+            add_log("[ALERT] No good frames for 30 s (bursts/s %.0f, noise floor %.1f dB): check antenna, LNA power "
+                    "(bias-T), cable and gain", std::max(0.0, g_bursts_ps), (double)g_engine.detector_noise_floor());
+    }
+
+    // ---- every interval: summary ----
+    static const int kIv[3] = {30, 60, 300};
+    const int iv = kIv[std::clamp(g_status_interval_idx, 0, 2)];
+    if (!have_last || now - last.t < std::chrono::seconds(iv)) return;
+    const Snap n = take();
+    const double dt = std::chrono::duration<double>(n.t - last.t).count();
+    if (dt <= 0) return;
+    auto d = [](uint64_t a, uint64_t b) { return a >= b ? a - b : a; };   // counters restart on a new run
+    const uint64_t parsed = d(n.parsed, last.parsed), errs = d(n.errs, last.errs);
+    const uint64_t good = parsed - std::min(parsed, errs);
+    const double good_ps = good / dt, bursts_ps = d(n.bursts, last.bursts) / dt, wide_ps = d(n.wide, last.wide) / dt;
+    const double rate = live && live->sample_rate() > 0 ? (double)live->sample_rate() : 1.0;
+    const uint64_t skipped = d(n.skipped, last.skipped), app = d(n.app, last.app), drv = d(n.drv, last.drv);
+    int sats = 0;
+    const uint64_t newest = g_engine.last_timestamp();
+    for (const auto &st : g_engine.satellites())
+        if (newest && st.last_seen_ns + (uint64_t)iv * 1000000000ULL >= newest) sats++;
+    const float floor_db = g_engine.detector_noise_floor();
+    double sys = -1, proc = -1;
+    const bool have_cpu = cpu_status.sample(sys, proc);
+    const double ram = process_ram_mb();
+    char cpu_s[96] = "";
+    if (have_cpu) snprintf(cpu_s, sizeof(cpu_s), " | CPU: computer %.0f%%, IridiScope %.0f%%", sys, proc);
+    char ram_s[48] = "";
+    if (ram >= 0) snprintf(ram_s, sizeof(ram_s), ", RAM %.0f MB", ram);
+    char ivs[16]; if (iv < 60) snprintf(ivs, sizeof(ivs), "%d s", iv); else snprintf(ivs, sizeof(ivs), "%d min", iv / 60);
+    add_log("[STATUS] Last %s: good %.0f/s, bursts %.0f/s%s, parse errors %.1f%%, satellites %d | detector %.0f%% "
+            "(CPU %.0f%%) | skipped bursts %llu, drops: IridiScope %.0f ms, driver %.0f ms%s%s | noise floor %.1f dB, %s",
+            ivs, good_ps, bursts_ps,
+            g_reject_wide ? (" (+" + std::to_string((int)std::lround(wide_ps)) + "/s wideband ignored)").c_str() : "",
+            parsed ? 100.0 * errs / parsed : 0.0, sats, std::max(0.0, g_det_load), std::max(0.0, g_det_cpu),
+            (unsigned long long)skipped, 1000.0 * app / rate, 1000.0 * drv / rate, cpu_s, ram_s, (double)floor_db,
+            gain_desc().c_str());
+    const uint64_t calls = d(n.msgs[5], last.msgs[5]);
+    add_log("[TRAFFIC] Last %s: voice calls saved %llu (%.0f s speech, %llu announcements), voice frames recovered %llu, "
+            "handoffs %llu (%llu followed) | ACARS %llu, SMS %llu, SBD %llu, pager %llu, ring alerts %llu",
+            ivs, (unsigned long long)calls, std::max(0.0, n.speech - last.speech), (unsigned long long)d(n.ann, last.ann),
+            (unsigned long long)d(n.vrec, last.vrec), (unsigned long long)d(n.ho_seen, last.ho_seen),
+            (unsigned long long)d(n.ho_fol, last.ho_fol), (unsigned long long)d(n.msgs[1], last.msgs[1]),
+            (unsigned long long)d(n.msgs[2], last.msgs[2]), (unsigned long long)d(n.msgs[3], last.msgs[3]),
+            (unsigned long long)d(n.msgs[4], last.msgs[4]), (unsigned long long)d(n.msgs[6], last.msgs[6]));
+
+    // Sudden change in decoded traffic vs. the recent average.
+    if (good_hist.size() >= 3) {
+        double avg = 0, bavg = 0;
+        for (double g : good_hist) avg += g;
+        for (double b : burst_hist) bavg += b;
+        avg /= good_hist.size(); bavg /= burst_hist.size();
+        if (avg >= 50.0 && good_ps < 0.5 * avg && cooled(cool_drop))
+            add_log("[ALERT] Good frames fell to %.0f/s from ~%.0f/s. %s", good_ps, avg,
+                    bursts_ps < 0.6 * bavg
+                        ? "Bursts fell too: fewer satellites in view, or antenna/LNA/cable/gain."
+                        : "Bursts didn't fall: decoding is failing (interference, overload, or CPU - see skipped/drops).");
+    }
+    good_hist.push_back(good_ps); burst_hist.push_back(bursts_ps);
+    while (good_hist.size() > 5) { good_hist.pop_front(); burst_hist.pop_front(); }
+    // Noise floor jump with the gain unchanged: antenna, LNA power, interference.
+    const bool gain_recent = now - g_gain_changed_at < std::chrono::seconds(iv + 5);
+    if (have_floor && !gain_recent && std::fabs(floor_db - last_floor) >= 3.0f && cooled(cool_floor))
+        add_log("[ALERT] Noise floor moved %+.1f dB (%.1f -> %.1f dB) with the gain unchanged: antenna, LNA power "
+                "(bias-T), cable, or local interference", (double)(floor_db - last_floor), (double)last_floor, (double)floor_db);
+    last_floor = floor_db; have_floor = true;
+    last = n;
+}
+
 int main(int argc, char **argv) {
     if (getenv("IRIDI_DEBUG")) irid::irid_debug = 1;
     if (argc >= 2) {
@@ -3136,33 +5435,22 @@ int main(int argc, char **argv) {
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    register_settings_handler();
 
     // Seed the window layout from the bundled default on first run, so the
     // shipped docking arrangement is the default.
     const char *ini_path = "iridiscope.ini";
     bool force_default = false;
+    // No saved layout yet: build the default arrangement in code.
 #ifdef _WIN32
-    if (GetFileAttributesA(ini_path) == INVALID_FILE_ATTRIBUTES) {
-        std::string def = std::string(IRIDISCOPE_ASSETS) + "/default_layout.ini";
-        if (!CopyFileA(def.c_str(), ini_path, FALSE)) force_default = true;
-    }
+    if (GetFileAttributesA(ini_path) == INVALID_FILE_ATTRIBUTES) force_default = true;
 #else
-    if (!file_exists(ini_path)) {
-        force_default = true;
-        for (const auto &d : asset_dirs()) {
-            std::vector<unsigned char> bytes;
-            if (!read_file_bytes(d + "/default_layout.ini", bytes)) continue;
-            std::ofstream o(ini_path, std::ios::binary);
-            if (o && o.write(reinterpret_cast<const char *>(bytes.data()),
-                             (std::streamsize)bytes.size())) {
-                force_default = false;
-                break;
-            }
-        }
-    }
+    if (!file_exists(ini_path)) force_default = true;
 #endif
     io.IniFilename = ini_path;
     bool dock_built = false;
+    // Every launch opens on the Voice and Messages tabs (and the Map).
+    g_layout_focus_frames = 3;
     apply_style();
 
     ImGui_ImplGlfw_InitForOpenGL(g_window, true);
@@ -3172,6 +5460,31 @@ int main(int argc, char **argv) {
     add_log("OpenGL: %s", glGetString(GL_VERSION) ? (const char *)glGetString(GL_VERSION) : "?");
 
     g_map_tex = load_map_texture(g_map_w, g_map_h);
+    // Defaults (settings_apply_all re-applies saved values once the .ini loads).
+    iridi_set_boost(g_protect_radio);
+    iridi_apply_thread_priority(IRIDI_PRIO_NORMAL);
+    ir_set_reject_wide(g_reject_wide);
+    iridi::MsgDb::instance().set_enabled(g_msgdb_on);
+    {
+        const int n = iridi::AnnouncementMatcher::instance().load("assets/announcements");
+        add_log("Announcement recognition: %d reference recording(s) loaded from assets/announcements", n);
+        g_engine.voices().set_sort_announcements(g_voice_sort_ann);
+    }
+    g_tiles.start();
+    g_tiles_night.configure(L"gibs.earthdata.nasa.gov",
+                            "/wmts/epsg3857/best/VIIRS_Black_Marble/default/2016-01-01/GoogleMapsCompatible_Level8/%d/%d/%d.png",
+                            "mapcache/blackmarble", "png");
+    g_tiles_night.start(2);
+    {
+        auto &tx = stt::Transcriber::instance();
+        tx.set_thread_init([] { iridi_apply_thread_priority(IRIDI_PRIO_BACKGROUND); });
+        tx.set_logger([](const std::string &l) { add_log("[VOICE] %s", l.c_str()); });
+        tx.set_vocabulary(g_stt_vocab);
+        tx.set_translate(g_stt_translate);
+        tx.set_large_for_all(g_stt_large_all);
+        tx.set_enabled(g_stt_on);
+        tx.set_models_dir("models");
+    }
 
     g_version_check.start(kUpdateUrl, IRIDISCOPE_VERSION_STRING);
     g_lookup.start();
@@ -3217,66 +5530,126 @@ int main(int argc, char **argv) {
         }
 
         update_autoplay();
+        if (g_sort_done.load() >= 0) {
+            add_log("Sorting existing recordings: %d of %d WAVs were network announcements, moved to "
+                    "recordings/announcements/", g_sort_moved.load(), g_sort_done.load());
+            g_sort_done = -1;
+        }
+        g_tiles.upload_ready();
+        g_tiles_night.upload_ready();
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
         ImGuiID dock_id = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
-        if (force_default && !dock_built) { build_default_dock_layout(dock_id); dock_built = true; }
+        // A layout saved by an older version gets the new default once.
+        if (!dock_built && g_saved_layout_version < kLayoutVersion) force_default = true;
+        if (force_default && !dock_built) {
+            build_default_dock_layout(dock_id); dock_built = true;
+            g_saved_layout_version = kLayoutVersion;
+            ImGui::MarkIniSettingsDirty();
+        }
+        if (g_reset_layout) { g_reset_layout = false; build_default_dock_layout(dock_id); add_log("Layout reset to default"); }
 
-        // Place the Pager and SMS tabs in the same dock group as Messages.
-        static bool grouped_msgs = false;
-        if (!grouped_msgs) {
-            ImGuiWindow *msgw = ImGui::FindWindowByName("Messages");
-            if (msgw && msgw->DockId) {
-                if (ImGuiWindow *w = ImGui::FindWindowByName("Bursts"))
-                    ImGui::SetWindowDock(w, msgw->DockId, ImGuiCond_Always);
-                if (ImGuiWindow *w = ImGui::FindWindowByName("Pager"))
-                    ImGui::SetWindowDock(w, msgw->DockId, ImGuiCond_Always);
-                if (ImGuiWindow *w = ImGui::FindWindowByName("SMS"))
-                    ImGui::SetWindowDock(w, msgw->DockId, ImGuiCond_Always);
-                if (ImGuiWindow *w = ImGui::FindWindowByName("SBD"))
-                    ImGui::SetWindowDock(w, msgw->DockId, ImGuiCond_Always);
-                if (ImGuiWindow *w = ImGui::FindWindowByName("Signaling"))
-                    ImGui::SetWindowDock(w, msgw->DockId, ImGuiCond_Always);
-                if (ImGuiWindow *w = ImGui::FindWindowByName("Broadcast"))
-                    ImGui::SetWindowDock(w, msgw->DockId, ImGuiCond_Always);
-                if (ImGuiWindow *w = ImGui::FindWindowByName("ITL"))
-                    ImGui::SetWindowDock(w, msgw->DockId, ImGuiCond_Always);
-                grouped_msgs = true;
-            }
+        // After building the default layout, pick the visible tab in each
+        // group (focus selects a docked window's tab). A user's own saved
+        // layout is never rearranged.
+        if (g_layout_focus_frames > 0 && --g_layout_focus_frames == 0) {
+            ImGui::SetWindowFocus("Voice");
+            ImGui::SetWindowFocus("Messages");
+            ImGui::SetWindowFocus("Map");
         }
 
-        // Place Paging in the same dock group as Satellites.
-        static bool grouped_sats = false;
-        if (!grouped_sats) {
-            ImGuiWindow *sw = ImGui::FindWindowByName("Satellites");
-            if (sw && sw->DockId) {
-                if (ImGuiWindow *w = ImGui::FindWindowByName("Paging"))
-                    ImGui::SetWindowDock(w, sw->DockId, ImGuiCond_Always);
-                grouped_sats = true;
-            }
-        }
-
-        // Make Messages the active tab in its dock group when the app opens.
-        static bool messages_focused = false;
-        if (!messages_focused) {
-            if (ImGui::FindWindowByName("Messages") != nullptr) {
-                ImGui::SetWindowFocus("Messages");
-                messages_focused = true;
-            }
-        }
-
+        { static int n = 0; if (++n % 30 == 0) mark_settings_dirty_if_changed(); }
         draw_menu_bar();
         draw_map_window();
         draw_spectrum_window();
         draw_waterfall_window();
         draw_bursts_window();
         draw_messages_window();
+        draw_log_window();
+        draw_transcription_window();
+        sweep_tick(); // runs even when the Control panel is hidden
+        update_detector_load();
+        update_event_tracking();
+        {
+            // Log sample drops as they happen (at most once a second) so their
+            // timing is visible: startup, traffic peaks, other programs, ...
+            static uint64_t last_app = 0, last_drv = 0;
+            static const void *last_src = nullptr;
+            static auto last_check = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            const auto *live = active_live_source();
+            if (live != last_src) { last_src = live; last_app = live ? live->dropped_samples() : 0;
+                                    last_drv = live ? live->driver_dropped_samples() : 0; }
+            if (live && now - last_check >= std::chrono::seconds(1)) {
+                last_check = now;
+                const uint64_t a = live->dropped_samples(), d = live->driver_dropped_samples();
+                if (a < last_app) last_app = 0;   // restarted
+                if (d < last_drv) last_drv = 0;
+                const double rate = live->sample_rate() > 0 ? (double)live->sample_rate() : 1.0;
+                if (a > last_app)
+                    add_log("[ALERT] Dropped %llu samples (%.0f ms) in IridiScope: the detector fell behind the radio; "
+                            "detector load %.0f%% (CPU %.0f%%), bursts/s %.0f",
+                            (unsigned long long)(a - last_app), 1000.0 * (a - last_app) / rate,
+                            g_det_load, std::max(0.0, g_det_cpu), g_bursts_ps);
+                {
+                    static uint64_t last_skip = 0;
+                    const uint64_t sk = g_engine.skipped_bursts();
+                    if (sk < last_skip) last_skip = 0;
+                    if (sk > last_skip)
+                        add_log("[ALERT] Skipped %llu bursts: decoders more than %.0f s behind (bursts/s %.0f)",
+                                (unsigned long long)(sk - last_skip), kBacklogS[std::clamp(g_backlog_idx, 0, 3)],
+                                g_bursts_ps);
+                    last_skip = sk;
+                }
+                if (d > last_drv)
+                    add_log("[ALERT] Dropped %llu samples (%.0f ms) in the Airspy driver (before IridiScope)",
+                            (unsigned long long)(d - last_drv), 1000.0 * (d - last_drv) / rate);
+                last_app = a; last_drv = d;
+            }
+        }
+        {
+            // Any gain change (manual or sweep, any SDR) shifts the whole
+            // spectrum; the burst detector's learned noise floor only updates
+            // when no bursts are active, so reset it rather than wait.
+            static std::string last_gain;
+            // Reset only after samples captured at the old gain have drained
+            // (IridiScope's buffer plus the driver's), so the new noise floor
+            // is learned purely at the new gain. Slider drags push it out.
+            static bool reset_pending = false;
+            static std::chrono::steady_clock::time_point reset_at;
+            char sig[160];
+            snprintf(sig, sizeof(sig), "%d|%d|%.1f|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d",
+                     g_source_kind, (int)g_sdr_agc, (double)g_sdr_gr, g_hrf_lna, g_hrf_vga, (int)g_hrf_amp,
+                     g_ap_gain_mode, g_ap_sense, g_ap_linear, g_ap_lna, g_ap_mixer, g_ap_vga,
+                     (int)g_ap_lna_agc, (int)g_ap_mixer_agc, (int)g_rtl_agc, (int)g_rtl_gain);
+            if (last_gain != sig) {
+                if (!last_gain.empty()) {
+                    g_gain_changed_at = std::chrono::steady_clock::now();
+                    if (g_engine.running()) add_log("[RADIO] Gain changed: %s", gain_desc().c_str());
+                    reset_pending = true;
+                    reset_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+                }
+                last_gain = sig;
+            }
+            if (reset_pending && std::chrono::steady_clock::now() >= reset_at) {
+                reset_pending = false;
+                if (g_engine.running()) {
+                    iridi::LiveIqSource *live = g_source_kind == 1 ? &g_sdr : g_source_kind == 2 ? &g_hackrf
+                                              : g_source_kind == 3 ? &g_airspy : g_source_kind == 4 ? &g_rtlsdr : nullptr;
+                    if (live) live->clear_buffer(); // drop anything still queued from before
+                    g_engine.reset_noise_floor();
+                }
+            }
+        }
         draw_satellites_window();
         draw_paging_window();
         draw_voice_window();
+        for (const auto &d : g_engine.voices().drain_diagnostics())
+            add_log(d.rfind("[", 0) == 0 ? "%s" : "[HANDOFF] %s", d.c_str());
+        log_status_tick();
         draw_acars_window();
         draw_acars_detail_window();
         draw_aircraft_info_window();
@@ -3306,6 +5679,10 @@ int main(int argc, char **argv) {
     if (g_sdr_scan_thread.joinable()) g_sdr_scan_thread.join();
     if (g_hrf_scan_thread.joinable()) g_hrf_scan_thread.join();
     if (g_ap_scan_thread.joinable()) g_ap_scan_thread.join();
+    g_tiles.stop();
+    g_tiles_night.stop();
+    stt::Transcriber::instance().shutdown();
+    iridi::MsgDb::instance().shutdown();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImPlot::DestroyContext();
